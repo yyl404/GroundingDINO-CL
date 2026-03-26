@@ -10,7 +10,7 @@ from groundingdino.models import build_model
 from groundingdino.util.misc import clean_state_dict
 from groundingdino.util.slconfig import SLConfig
 
-from .voc import VOC_CLASSES, build_caption, build_class_token_map
+from .voc import VOC_CLASSES
 
 
 def load_groundingdino_model(config_path: str, checkpoint_path: str, device: str = "cuda"):
@@ -42,6 +42,7 @@ def decode_predictions(
     class_token_map: Dict[int, List[int]],
     box_threshold: float,
     text_threshold: float,
+    num_classes: int = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     logits = outputs["pred_logits"].sigmoid()[0].detach().cpu()
     boxes_cxcywh = outputs["pred_boxes"][0].detach().cpu()
@@ -55,7 +56,9 @@ def decode_predictions(
             (0,), dtype=np.int64
         )
 
-    class_scores = _token_scores_to_class_scores(logits, class_token_map, len(VOC_CLASSES))
+    if num_classes is None:
+        num_classes = max(class_token_map.keys()) + 1 if class_token_map else len(VOC_CLASSES)
+    class_scores = _token_scores_to_class_scores(logits, class_token_map, num_classes)
     best_scores, best_class = class_scores.max(dim=1)
     keep_text = best_scores > text_threshold
     boxes_cxcywh = boxes_cxcywh[keep_text]
@@ -93,10 +96,16 @@ def evaluate_voc_map(
     all_ground_truths: Dict[str, List[Tuple[int, np.ndarray, int]]],
     num_classes: int = 20,
     iou_thresh: float = 0.5,
+    class_names: List[str] = None,
+    eval_class_ids: List[int] = None,
 ) -> Dict[str, float]:
     ap_per_class = {}
+    if class_names is None:
+        class_names = VOC_CLASSES
+    if eval_class_ids is None:
+        eval_class_ids = list(range(num_classes))
 
-    for class_id in range(num_classes):
+    for class_id in eval_class_ids:
         preds = []
         npos = 0
         gt_by_image = {}
@@ -164,7 +173,8 @@ def evaluate_voc_map(
     mAP = float(np.mean(list(ap_per_class.values()))) if ap_per_class else 0.0
     metrics = {"mAP@0.5": mAP}
     for class_id, ap in ap_per_class.items():
-        metrics[f"AP50_{VOC_CLASSES[class_id]}"] = float(ap)
+        class_name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
+        metrics[f"AP50_{class_name}"] = float(ap)
     return metrics
 
 

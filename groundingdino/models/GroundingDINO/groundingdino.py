@@ -15,7 +15,7 @@
 # Copyright (c) 2020 SenseTime. All Rights Reserved.
 # ------------------------------------------------------------------------
 import copy
-from typing import List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -94,6 +94,8 @@ class GroundingDINO(nn.Module):
 
         # prompt tuning (disabled by default)
         self.prompt_embeddings = None
+        self.prompt_mode = "shared"
+        self.prompt_token_map = None
 
         # setting query dim
         self.query_dim = query_dim
@@ -227,12 +229,35 @@ class GroundingDINO(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
 
-    def init_prompt_tuning(self, prompt_length=16, init_std=0.02):
-        if prompt_length <= 0:
-            raise ValueError("prompt_length must be positive.")
-        prompt = torch.zeros(prompt_length, self.hidden_dim)
+    def init_prompt_tuning(self, prompt_length=16, init_std=0.02, num_embeddings=None, mode="shared"):
+        if mode not in {"shared", "class_independent"}:
+            raise ValueError(f"Unsupported prompt mode: {mode}")
+        if num_embeddings is None:
+            num_embeddings = prompt_length
+        if num_embeddings <= 0:
+            raise ValueError("num_embeddings must be positive.")
+        prompt = torch.zeros(num_embeddings, self.hidden_dim)
         nn.init.normal_(prompt, mean=0.0, std=init_std)
         self.prompt_embeddings = nn.Parameter(prompt)
+        self.prompt_mode = mode
+
+    def set_prompt_token_map(self, token_to_prompt_idx: Dict[int, int], max_text_len: Optional[int] = None):
+        if self.prompt_embeddings is None:
+            raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
+        if max_text_len is None:
+            max_text_len = self.max_text_len
+        token_map = torch.full((max_text_len,), -1, dtype=torch.long)
+        max_prompt_idx = self.prompt_embeddings.shape[0] - 1
+        for token_idx, prompt_idx in token_to_prompt_idx.items():
+            if token_idx < 0 or token_idx >= max_text_len:
+                continue
+            if prompt_idx < 0 or prompt_idx > max_prompt_idx:
+                continue
+            token_map[token_idx] = int(prompt_idx)
+        self.prompt_token_map = token_map
+
+    def clear_prompt_token_map(self):
+        self.prompt_token_map = None
 
     def freeze_except_prompt(self):
         for _, parameter in self.named_parameters():
@@ -244,9 +269,18 @@ class GroundingDINO(nn.Module):
     def get_prompt_state_dict(self):
         if self.prompt_embeddings is None:
             raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
-        return {"prompt_embeddings": self.prompt_embeddings.detach().cpu()}
+        state_dict = {
+            "prompt_embeddings": self.prompt_embeddings.detach().cpu(),
+            "prompt_mode": self.prompt_mode,
+        }
+        if self.prompt_token_map is not None:
+            state_dict["prompt_token_map"] = self.prompt_token_map.detach().cpu()
+        return state_dict
 
     def load_prompt_state_dict(self, state_dict):
+        if "prompt_state_dict" in state_dict and isinstance(state_dict["prompt_state_dict"], dict):
+            state_dict = state_dict["prompt_state_dict"]
+
         prompt = state_dict.get("prompt_embeddings")
         if prompt is None:
             raise KeyError("prompt_embeddings was not found in prompt state dict.")
@@ -256,6 +290,13 @@ class GroundingDINO(nn.Module):
         else:
             with torch.no_grad():
                 self.prompt_embeddings.copy_(prompt)
+
+        self.prompt_mode = state_dict.get("prompt_mode", "shared")
+        prompt_token_map = state_dict.get("prompt_token_map")
+        if prompt_token_map is not None:
+            self.prompt_token_map = prompt_token_map.long().clone()
+        else:
+            self.prompt_token_map = None
 
     def forward(self, samples: NestedTensor, targets: List = None, **kw):
         """The forward expects a NestedTensor, which consists of:
@@ -311,10 +352,21 @@ class GroundingDINO(nn.Module):
 
         encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
         if self.prompt_embeddings is not None:
-            prompt_len = min(encoded_text.shape[1], self.prompt_embeddings.shape[0])
-            encoded_text[:, :prompt_len, :] = (
-                encoded_text[:, :prompt_len, :] + self.prompt_embeddings[:prompt_len].unsqueeze(0)
-            )
+            if self.prompt_token_map is None:
+                prompt_len = min(encoded_text.shape[1], self.prompt_embeddings.shape[0])
+                encoded_text[:, :prompt_len, :] = (
+                    encoded_text[:, :prompt_len, :] + self.prompt_embeddings[:prompt_len].unsqueeze(0)
+                )
+            else:
+                valid_len = min(encoded_text.shape[1], self.prompt_token_map.shape[0])
+                token_map = self.prompt_token_map[:valid_len].to(encoded_text.device)
+                valid_mask = (token_map >= 0) & (token_map < self.prompt_embeddings.shape[0])
+                if valid_mask.any():
+                    token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+                    prompt_indices = token_map[token_positions]
+                    encoded_text[:, token_positions, :] = (
+                        encoded_text[:, token_positions, :] + self.prompt_embeddings[prompt_indices].unsqueeze(0)
+                    )
         text_token_mask = tokenized.attention_mask.bool()  # bs, 195
         # text_token_mask: True for nomask, False for mask
         # text_self_attention_masks: True for nomask, False for mask

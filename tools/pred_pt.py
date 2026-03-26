@@ -1,7 +1,7 @@
 import argparse
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +23,8 @@ from groundingdino.prompt_tuning.voc import (
     VOCDataset,
     build_caption,
     build_class_token_map,
+    build_domain_category_name,
+    get_split_present_class_names,
 )
 
 
@@ -31,6 +33,12 @@ def parse_args():
     parser.add_argument("--config_file", type=str, required=True, help="Model config path.")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Base model checkpoint path.")
     parser.add_argument("--prompt_path", type=str, default="", help="Trained prompt weight path.")
+    parser.add_argument(
+        "--domain_id",
+        type=str,
+        default="voc2007",
+        help="Domain id for reconstructing class-independent mapping when metadata is incomplete.",
+    )
     parser.add_argument(
         "--input",
         type=str,
@@ -64,6 +72,49 @@ def parse_args():
         help="Valid image extensions when input is a directory.",
     )
     return parser.parse_args()
+
+
+def _load_prompt_checkpoint(ckpt_path: str):
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(payload, dict) and "prompt_state_dict" in payload:
+        return payload["prompt_state_dict"], payload.get("metadata", {})
+    if isinstance(payload, dict) and "prompt_embeddings" in payload:
+        return payload, {}
+    raise ValueError(f"Unsupported prompt checkpoint format: {ckpt_path}")
+
+
+def _infer_prompt_mode(prompt_state: Dict, metadata: Dict) -> str:
+    mode = metadata.get("prompt_mode")
+    if mode in {"shared", "class_independent"}:
+        return mode
+    if isinstance(prompt_state, dict) and prompt_state.get("prompt_token_map") is not None:
+        return "class_independent"
+    return "shared"
+
+
+def _extract_learned_class_ids(metadata: Dict) -> Optional[Set[int]]:
+    cat_to_idx = metadata.get("category_to_prompt_embedding_idx", {}) or {}
+    if not cat_to_idx:
+        return None
+    learned = set()
+    for category_name in cat_to_idx.keys():
+        class_name = category_name.split(":")[-1]
+        if class_name in VOC_CLASSES:
+            learned.add(VOC_CLASSES.index(class_name))
+    return learned
+
+
+def _build_token_prompt_map_from_metadata(metadata: Dict, class_token_map: Dict[int, List[int]]) -> Dict[int, int]:
+    cat_to_idx = metadata.get("category_to_prompt_embedding_idx", {}) or {}
+    token_to_prompt_idx = {}
+    for category_name, prompt_idx in cat_to_idx.items():
+        class_name = category_name.split(":")[-1]
+        if class_name not in VOC_CLASSES:
+            continue
+        class_id = VOC_CLASSES.index(class_name)
+        for token_id in class_token_map[class_id]:
+            token_to_prompt_idx[token_id] = int(prompt_idx)
+    return token_to_prompt_idx
 
 
 def build_infer_transform():
@@ -146,6 +197,7 @@ def run_inference_mode(args, model, class_token_map):
             class_token_map=class_token_map,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
+            num_classes=len(VOC_CLASSES),
         )
         boxes_xyxy = to_absolute_xyxy(boxes_cxcywh, w, h)
 
@@ -161,7 +213,7 @@ def run_inference_mode(args, model, class_token_map):
         print(f"Inference done: {image_path}, detections={len(scores)}")
 
 
-def run_test_mode(args, model, class_token_map):
+def run_test_mode(args, model, class_token_map, eval_class_ids: List[int]):
     os.makedirs(args.output_dir, exist_ok=True)
     caption = build_caption(VOC_CLASSES)
     transform = build_infer_transform()
@@ -195,6 +247,7 @@ def run_test_mode(args, model, class_token_map):
             class_token_map=class_token_map,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
+            num_classes=len(VOC_CLASSES),
         )
         boxes_xyxy = to_absolute_xyxy(boxes_cxcywh, orig_w, orig_h)
 
@@ -216,26 +269,73 @@ def run_test_mode(args, model, class_token_map):
         if (i + 1) % 100 == 0:
             print(f"Processed {i + 1}/{len(dataset)} samples for evaluation.")
 
-    metrics = evaluate_voc_map(all_predictions, all_ground_truths, num_classes=len(VOC_CLASSES))
+    metrics = evaluate_voc_map(
+        all_predictions,
+        all_ground_truths,
+        num_classes=len(VOC_CLASSES),
+        class_names=VOC_CLASSES,
+        eval_class_ids=eval_class_ids,
+    )
     metrics_path = os.path.join(args.output_dir, f"metrics_{args.split}.json")
     save_metrics(metrics_path, metrics)
-    print(f"Evaluation done on split={args.split}. mAP@0.5={metrics['mAP@0.5']:.4f}")
+    print(
+        f"Evaluation done on split={args.split}. classes={len(eval_class_ids)} "
+        f"mAP@0.5={metrics['mAP@0.5']:.4f}"
+    )
     print(f"Metrics saved to: {metrics_path}")
 
 
 def main():
     args = parse_args()
     model = load_groundingdino_model(args.config_file, args.checkpoint_path, device=args.device)
-    model.init_prompt_tuning(prompt_length=args.prompt_length)
+    class_token_map = build_class_token_map(model.tokenizer, VOC_CLASSES)
+
+    metadata = {}
+    learned_class_ids = set(range(len(VOC_CLASSES)))
     if args.prompt_path:
-        prompt_state = torch.load(args.prompt_path, map_location="cpu")
+        prompt_state, metadata = _load_prompt_checkpoint(args.prompt_path)
+        prompt_mode = _infer_prompt_mode(prompt_state, metadata)
+        prompt_emb = prompt_state.get("prompt_embeddings")
+        if prompt_emb is None:
+            raise KeyError("prompt_embeddings was not found in prompt checkpoint.")
+        prompt_len = int(prompt_emb.shape[0])
+        model.init_prompt_tuning(
+            prompt_length=prompt_len,
+            num_embeddings=prompt_len,
+            mode=prompt_mode,
+        )
         model.load_prompt_state_dict(prompt_state)
+        if prompt_mode == "class_independent" and model.prompt_token_map is None:
+            if not metadata:
+                print("[Warning] Missing metadata for class-independent prompt; fallback to shared decode behavior.")
+            else:
+                token_to_prompt_idx = _build_token_prompt_map_from_metadata(metadata, class_token_map)
+                model.set_prompt_token_map(token_to_prompt_idx)
+        extracted = _extract_learned_class_ids(metadata)
+        if extracted is not None:
+            learned_class_ids = extracted
         print(f"Loaded prompt weights from: {args.prompt_path}")
+        print(f"Prompt mode inferred from checkpoint: {_infer_prompt_mode(prompt_state, metadata)}")
+    else:
+        model.init_prompt_tuning(prompt_length=args.prompt_length, mode="shared")
+
     model.to(args.device)
 
-    class_token_map = build_class_token_map(model.tokenizer, VOC_CLASSES)
     if args.test:
-        run_test_mode(args, model, class_token_map)
+        dataset_classes = get_split_present_class_names(args.input, args.split, classes=VOC_CLASSES)
+        dataset_class_ids = {VOC_CLASSES.index(c) for c in dataset_classes}
+        eval_class_ids = sorted(dataset_class_ids.intersection(learned_class_ids))
+        missing_ids = sorted(dataset_class_ids - learned_class_ids)
+        if missing_ids:
+            missing_names = [VOC_CLASSES[i] for i in missing_ids]
+            print(
+                "[Warning] Dataset contains classes not covered by current prompt embedding: "
+                + ", ".join(missing_names)
+            )
+        if not eval_class_ids:
+            print("[Warning] No overlap between learned classes and dataset classes; skip mAP evaluation.")
+            return
+        run_test_mode(args, model, class_token_map, eval_class_ids=eval_class_ids)
     else:
         run_inference_mode(args, model, class_token_map)
 

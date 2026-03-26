@@ -36,6 +36,10 @@ def build_caption(classes: List[str]) -> str:
     return " . ".join(classes) + " ."
 
 
+def build_domain_category_name(category_name: str, domain: str) -> str:
+    return f"{domain}:{category_name}"
+
+
 def _normalize_split_name(split: str) -> str:
     split = split.strip().lower()
     if split not in {"train", "val", "test", "trainval"}:
@@ -51,6 +55,27 @@ def _read_split_ids(voc_root: str, split: str) -> List[str]:
     with open(split_file, "r", encoding="utf-8") as f:
         ids = [line.strip() for line in f.readlines() if line.strip()]
     return ids
+
+
+def get_split_present_class_names(voc_root: str, split: str, classes: List[str] = None) -> List[str]:
+    classes = classes if classes is not None else VOC_CLASSES
+    class_to_id = {name: i for i, name in enumerate(classes)}
+    image_ids = _read_split_ids(voc_root, split)
+    annotations_dir = os.path.join(voc_root, "Annotations")
+    if not os.path.isdir(annotations_dir):
+        raise FileNotFoundError(f"Annotation directory does not exist: {annotations_dir}")
+
+    present_ids = set()
+    for image_id in image_ids:
+        anno_path = os.path.join(annotations_dir, f"{image_id}.xml")
+        if not os.path.exists(anno_path):
+            continue
+        _boxes, labels, _difficult_flags = _parse_voc_annotation(
+            anno_path, class_to_id=class_to_id, keep_difficult=True
+        )
+        for label in labels:
+            present_ids.add(int(label))
+    return [classes[i] for i in sorted(present_ids)]
 
 
 def _parse_voc_annotation(xml_path: str, class_to_id: Dict[str, int], keep_difficult: bool):
