@@ -92,6 +92,9 @@ class GroundingDINO(nn.Module):
         self.max_text_len = 256
         self.sub_sentence_present = sub_sentence_present
 
+        # prompt tuning (disabled by default)
+        self.prompt_embeddings = None
+
         # setting query dim
         self.query_dim = query_dim
         assert query_dim == 4
@@ -224,6 +227,36 @@ class GroundingDINO(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
 
+    def init_prompt_tuning(self, prompt_length=16, init_std=0.02):
+        if prompt_length <= 0:
+            raise ValueError("prompt_length must be positive.")
+        prompt = torch.zeros(prompt_length, self.hidden_dim)
+        nn.init.normal_(prompt, mean=0.0, std=init_std)
+        self.prompt_embeddings = nn.Parameter(prompt)
+
+    def freeze_except_prompt(self):
+        for _, parameter in self.named_parameters():
+            parameter.requires_grad_(False)
+        if self.prompt_embeddings is None:
+            raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
+        self.prompt_embeddings.requires_grad_(True)
+
+    def get_prompt_state_dict(self):
+        if self.prompt_embeddings is None:
+            raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
+        return {"prompt_embeddings": self.prompt_embeddings.detach().cpu()}
+
+    def load_prompt_state_dict(self, state_dict):
+        prompt = state_dict.get("prompt_embeddings")
+        if prompt is None:
+            raise KeyError("prompt_embeddings was not found in prompt state dict.")
+        prompt = prompt.float()
+        if self.prompt_embeddings is None or self.prompt_embeddings.shape != prompt.shape:
+            self.prompt_embeddings = nn.Parameter(prompt.clone())
+        else:
+            with torch.no_grad():
+                self.prompt_embeddings.copy_(prompt)
+
     def forward(self, samples: NestedTensor, targets: List = None, **kw):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -277,6 +310,11 @@ class GroundingDINO(nn.Module):
         bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
 
         encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
+        if self.prompt_embeddings is not None:
+            prompt_len = min(encoded_text.shape[1], self.prompt_embeddings.shape[0])
+            encoded_text[:, :prompt_len, :] = (
+                encoded_text[:, :prompt_len, :] + self.prompt_embeddings[:prompt_len].unsqueeze(0)
+            )
         text_token_mask = tokenized.attention_mask.bool()  # bs, 195
         # text_token_mask: True for nomask, False for mask
         # text_self_attention_masks: True for nomask, False for mask
