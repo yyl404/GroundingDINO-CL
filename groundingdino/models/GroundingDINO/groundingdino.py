@@ -96,6 +96,9 @@ class GroundingDINO(nn.Module):
         self.prompt_embeddings = None
         self.prompt_mode = "shared"
         self.prompt_token_map = None
+        self.aux_prompt_embeddings = None
+        self.aux_prompt_mode = "shared"
+        self.aux_prompt_token_map = None
 
         # setting query dim
         self.query_dim = query_dim
@@ -241,6 +244,18 @@ class GroundingDINO(nn.Module):
         self.prompt_embeddings = nn.Parameter(prompt)
         self.prompt_mode = mode
 
+    def init_aux_prompt_tuning(self, prompt_length=16, init_std=0.02, num_embeddings=None, mode="shared"):
+        if mode not in {"shared", "class_independent"}:
+            raise ValueError(f"Unsupported aux prompt mode: {mode}")
+        if num_embeddings is None:
+            num_embeddings = prompt_length
+        if num_embeddings <= 0:
+            raise ValueError("num_embeddings must be positive.")
+        prompt = torch.zeros(num_embeddings, self.hidden_dim)
+        nn.init.normal_(prompt, mean=0.0, std=init_std)
+        self.aux_prompt_embeddings = nn.Parameter(prompt)
+        self.aux_prompt_mode = mode
+
     def set_prompt_token_map(self, token_to_prompt_idx: Dict[int, int], max_text_len: Optional[int] = None):
         if self.prompt_embeddings is None:
             raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
@@ -256,8 +271,26 @@ class GroundingDINO(nn.Module):
             token_map[token_idx] = int(prompt_idx)
         self.prompt_token_map = token_map
 
+    def set_aux_prompt_token_map(self, token_to_prompt_idx: Dict[int, int], max_text_len: Optional[int] = None):
+        if self.aux_prompt_embeddings is None:
+            raise RuntimeError("Aux prompt tuning is not initialized. Call init_aux_prompt_tuning first.")
+        if max_text_len is None:
+            max_text_len = self.max_text_len
+        token_map = torch.full((max_text_len,), -1, dtype=torch.long)
+        max_prompt_idx = self.aux_prompt_embeddings.shape[0] - 1
+        for token_idx, prompt_idx in token_to_prompt_idx.items():
+            if token_idx < 0 or token_idx >= max_text_len:
+                continue
+            if prompt_idx < 0 or prompt_idx > max_prompt_idx:
+                continue
+            token_map[token_idx] = int(prompt_idx)
+        self.aux_prompt_token_map = token_map
+
     def clear_prompt_token_map(self):
         self.prompt_token_map = None
+
+    def clear_aux_prompt_token_map(self):
+        self.aux_prompt_token_map = None
 
     def freeze_except_prompt(self):
         for _, parameter in self.named_parameters():
@@ -265,6 +298,20 @@ class GroundingDINO(nn.Module):
         if self.prompt_embeddings is None:
             raise RuntimeError("Prompt tuning is not initialized. Call init_prompt_tuning first.")
         self.prompt_embeddings.requires_grad_(True)
+
+    def freeze_except_selected_prompts(self, train_main_prompt: bool, train_aux_prompt: bool):
+        for _, parameter in self.named_parameters():
+            parameter.requires_grad_(False)
+        if train_main_prompt:
+            if self.prompt_embeddings is None:
+                raise RuntimeError("Main prompt tuning is not initialized.")
+            self.prompt_embeddings.requires_grad_(True)
+        if train_aux_prompt:
+            if self.aux_prompt_embeddings is None:
+                raise RuntimeError("Aux prompt tuning is not initialized.")
+            self.aux_prompt_embeddings.requires_grad_(True)
+        if not train_main_prompt and not train_aux_prompt:
+            raise RuntimeError("At least one prompt branch should be trainable.")
 
     def get_prompt_state_dict(self):
         if self.prompt_embeddings is None:
@@ -275,6 +322,11 @@ class GroundingDINO(nn.Module):
         }
         if self.prompt_token_map is not None:
             state_dict["prompt_token_map"] = self.prompt_token_map.detach().cpu()
+        if self.aux_prompt_embeddings is not None:
+            state_dict["aux_prompt_embeddings"] = self.aux_prompt_embeddings.detach().cpu()
+            state_dict["aux_prompt_mode"] = self.aux_prompt_mode
+        if self.aux_prompt_token_map is not None:
+            state_dict["aux_prompt_token_map"] = self.aux_prompt_token_map.detach().cpu()
         return state_dict
 
     def load_prompt_state_dict(self, state_dict):
@@ -298,6 +350,181 @@ class GroundingDINO(nn.Module):
         else:
             self.prompt_token_map = None
 
+        aux_prompt = state_dict.get("aux_prompt_embeddings")
+        if aux_prompt is not None:
+            aux_prompt = aux_prompt.float()
+            if self.aux_prompt_embeddings is None or self.aux_prompt_embeddings.shape != aux_prompt.shape:
+                self.aux_prompt_embeddings = nn.Parameter(aux_prompt.clone())
+            else:
+                with torch.no_grad():
+                    self.aux_prompt_embeddings.copy_(aux_prompt)
+            self.aux_prompt_mode = state_dict.get("aux_prompt_mode", "shared")
+            aux_prompt_token_map = state_dict.get("aux_prompt_token_map")
+            if aux_prompt_token_map is not None:
+                self.aux_prompt_token_map = aux_prompt_token_map.long().clone()
+            else:
+                self.aux_prompt_token_map = None
+        else:
+            self.aux_prompt_embeddings = None
+            self.aux_prompt_mode = "shared"
+            self.aux_prompt_token_map = None
+
+    def _apply_prompt_embeddings(
+        self,
+        encoded_text: torch.Tensor,
+        prompt_embeddings: Optional[torch.Tensor],
+        prompt_token_map: Optional[torch.Tensor],
+        prompt_token_map_override=None,
+    ) -> torch.Tensor:
+        if prompt_embeddings is None:
+            return encoded_text
+
+        token_map_to_use = prompt_token_map_override
+        if token_map_to_use is None:
+            token_map_to_use = prompt_token_map
+
+        if token_map_to_use is None:
+            prompt_len = min(encoded_text.shape[1], prompt_embeddings.shape[0])
+            encoded_text[:, :prompt_len, :] = (
+                encoded_text[:, :prompt_len, :] + prompt_embeddings[:prompt_len].unsqueeze(0)
+            )
+            return encoded_text
+
+        if isinstance(token_map_to_use, list):
+            if len(token_map_to_use) != encoded_text.shape[0]:
+                raise ValueError("Length of prompt_token_map_override list must match batch size.")
+            for batch_idx, token_map in enumerate(token_map_to_use):
+                if token_map is None:
+                    prompt_len = min(encoded_text.shape[1], prompt_embeddings.shape[0])
+                    encoded_text[batch_idx : batch_idx + 1, :prompt_len, :] = (
+                        encoded_text[batch_idx : batch_idx + 1, :prompt_len, :]
+                        + prompt_embeddings[:prompt_len].unsqueeze(0)
+                    )
+                    continue
+                valid_len = min(encoded_text.shape[1], token_map.shape[0])
+                local_map = token_map[:valid_len].to(encoded_text.device)
+                valid_mask = (local_map >= 0) & (local_map < prompt_embeddings.shape[0])
+                if valid_mask.any():
+                    token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+                    prompt_indices = local_map[token_positions]
+                    encoded_text[batch_idx, token_positions, :] = (
+                        encoded_text[batch_idx, token_positions, :] + prompt_embeddings[prompt_indices]
+                    )
+            return encoded_text
+
+        valid_len = min(encoded_text.shape[1], token_map_to_use.shape[0])
+        token_map = token_map_to_use[:valid_len].to(encoded_text.device)
+        valid_mask = (token_map >= 0) & (token_map < prompt_embeddings.shape[0])
+        if valid_mask.any():
+            token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+            prompt_indices = token_map[token_positions]
+            encoded_text[:, token_positions, :] = (
+                encoded_text[:, token_positions, :] + prompt_embeddings[prompt_indices].unsqueeze(0)
+            )
+        return encoded_text
+
+    def _encode_text_branch(
+        self,
+        captions: List[str],
+        device,
+        prompt_embeddings: Optional[torch.Tensor],
+        prompt_token_map: Optional[torch.Tensor],
+        prompt_token_map_override=None,
+    ):
+        tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(device)
+        (
+            text_self_attention_masks,
+            position_ids,
+            _cate_to_token_mask_list,
+        ) = generate_masks_with_special_tokens_and_transfer_map(
+            tokenized, self.specical_tokens, self.tokenizer
+        )
+
+        if text_self_attention_masks.shape[1] > self.max_text_len:
+            text_self_attention_masks = text_self_attention_masks[
+                :, : self.max_text_len, : self.max_text_len
+            ]
+            position_ids = position_ids[:, : self.max_text_len]
+            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
+            tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
+            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
+
+        if self.sub_sentence_present:
+            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
+            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+            tokenized_for_encoder["position_ids"] = position_ids
+        else:
+            tokenized_for_encoder = tokenized
+
+        bert_output = self.bert(**tokenized_for_encoder)
+        encoded_text = self.feat_map(bert_output["last_hidden_state"])
+        encoded_text = self._apply_prompt_embeddings(
+            encoded_text=encoded_text,
+            prompt_embeddings=prompt_embeddings,
+            prompt_token_map=prompt_token_map,
+            prompt_token_map_override=prompt_token_map_override,
+        )
+        text_token_mask = tokenized.attention_mask.bool()
+        return {
+            "encoded_text": encoded_text,
+            "text_token_mask": text_token_mask,
+            "position_ids": position_ids,
+            "text_self_attention_masks": text_self_attention_masks,
+        }
+
+    def _concat_text_branches(self, main_text_dict: Dict[str, torch.Tensor], aux_text_dict: Dict[str, torch.Tensor]):
+        encoded_text = torch.cat([main_text_dict["encoded_text"], aux_text_dict["encoded_text"]], dim=1)
+        text_token_mask = torch.cat(
+            [main_text_dict["text_token_mask"], aux_text_dict["text_token_mask"]], dim=1
+        )
+        position_ids = torch.cat([main_text_dict["position_ids"], aux_text_dict["position_ids"]], dim=1)
+
+        bs, main_len, _ = main_text_dict["encoded_text"].shape
+        aux_len = aux_text_dict["encoded_text"].shape[1]
+        text_self_attention_masks = torch.zeros(
+            (bs, main_len + aux_len, main_len + aux_len),
+            dtype=main_text_dict["text_self_attention_masks"].dtype,
+            device=main_text_dict["text_self_attention_masks"].device,
+        )
+        text_self_attention_masks[:, :main_len, :main_len] = main_text_dict["text_self_attention_masks"]
+        text_self_attention_masks[:, main_len:, main_len:] = aux_text_dict["text_self_attention_masks"]
+
+        if encoded_text.shape[1] > self.max_text_len:
+            keep_main = min(main_len, self.max_text_len)
+            keep_aux = min(aux_len, max(self.max_text_len - keep_main, 0))
+            encoded_text = torch.cat(
+                [encoded_text[:, :keep_main, :], encoded_text[:, main_len : main_len + keep_aux, :]], dim=1
+            )
+            text_token_mask = torch.cat(
+                [
+                    text_token_mask[:, :keep_main],
+                    text_token_mask[:, main_len : main_len + keep_aux],
+                ],
+                dim=1,
+            )
+            position_ids = torch.cat(
+                [position_ids[:, :keep_main], position_ids[:, main_len : main_len + keep_aux]], dim=1
+            )
+            text_self_attention_masks = torch.zeros(
+                (bs, keep_main + keep_aux, keep_main + keep_aux),
+                dtype=main_text_dict["text_self_attention_masks"].dtype,
+                device=main_text_dict["text_self_attention_masks"].device,
+            )
+            text_self_attention_masks[:, :keep_main, :keep_main] = main_text_dict[
+                "text_self_attention_masks"
+            ][:, :keep_main, :keep_main]
+            if keep_aux > 0:
+                text_self_attention_masks[:, keep_main:, keep_main:] = aux_text_dict[
+                    "text_self_attention_masks"
+                ][:, :keep_aux, :keep_aux]
+
+        return {
+            "encoded_text": encoded_text,
+            "text_token_mask": text_token_mask,
+            "position_ids": position_ids,
+            "text_self_attention_masks": text_self_attention_masks,
+        }
+
     def forward(self, samples: NestedTensor, targets: List = None, **kw):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -318,73 +545,27 @@ class GroundingDINO(nn.Module):
         else:
             captions = [t["caption"] for t in targets]
 
-        # encoder texts
-        tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
-            samples.device
+        main_prompt_token_map_override = kw.get("prompt_token_map_override")
+        main_text_dict = self._encode_text_branch(
+            captions=captions,
+            device=samples.device,
+            prompt_embeddings=self.prompt_embeddings,
+            prompt_token_map=self.prompt_token_map,
+            prompt_token_map_override=main_prompt_token_map_override,
         )
-        (
-            text_self_attention_masks,
-            position_ids,
-            cate_to_token_mask_list,
-        ) = generate_masks_with_special_tokens_and_transfer_map(
-            tokenized, self.specical_tokens, self.tokenizer
-        )
-
-        if text_self_attention_masks.shape[1] > self.max_text_len:
-            text_self_attention_masks = text_self_attention_masks[
-                :, : self.max_text_len, : self.max_text_len
-            ]
-            position_ids = position_ids[:, : self.max_text_len]
-            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
-            tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
-            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
-
-        # extract text embeddings
-        if self.sub_sentence_present:
-            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
-            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
-            tokenized_for_encoder["position_ids"] = position_ids
+        aux_captions = kw.get("aux_captions")
+        if aux_captions is not None:
+            aux_prompt_token_map_override = kw.get("aux_prompt_token_map_override")
+            aux_text_dict = self._encode_text_branch(
+                captions=aux_captions,
+                device=samples.device,
+                prompt_embeddings=self.aux_prompt_embeddings,
+                prompt_token_map=self.aux_prompt_token_map,
+                prompt_token_map_override=aux_prompt_token_map_override,
+            )
+            text_dict = self._concat_text_branches(main_text_dict, aux_text_dict)
         else:
-            # import ipdb; ipdb.set_trace()
-            tokenized_for_encoder = tokenized
-
-        bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
-
-        encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
-        if self.prompt_embeddings is not None:
-            if self.prompt_token_map is None:
-                prompt_len = min(encoded_text.shape[1], self.prompt_embeddings.shape[0])
-                encoded_text[:, :prompt_len, :] = (
-                    encoded_text[:, :prompt_len, :] + self.prompt_embeddings[:prompt_len].unsqueeze(0)
-                )
-            else:
-                valid_len = min(encoded_text.shape[1], self.prompt_token_map.shape[0])
-                token_map = self.prompt_token_map[:valid_len].to(encoded_text.device)
-                valid_mask = (token_map >= 0) & (token_map < self.prompt_embeddings.shape[0])
-                if valid_mask.any():
-                    token_positions = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
-                    prompt_indices = token_map[token_positions]
-                    encoded_text[:, token_positions, :] = (
-                        encoded_text[:, token_positions, :] + self.prompt_embeddings[prompt_indices].unsqueeze(0)
-                    )
-        text_token_mask = tokenized.attention_mask.bool()  # bs, 195
-        # text_token_mask: True for nomask, False for mask
-        # text_self_attention_masks: True for nomask, False for mask
-
-        if encoded_text.shape[1] > self.max_text_len:
-            encoded_text = encoded_text[:, : self.max_text_len, :]
-            text_token_mask = text_token_mask[:, : self.max_text_len]
-            position_ids = position_ids[:, : self.max_text_len]
-            text_self_attention_masks = text_self_attention_masks[
-                :, : self.max_text_len, : self.max_text_len
-            ]
-
-        text_dict = {
-            "encoded_text": encoded_text,  # bs, 195, d_model
-            "text_token_mask": text_token_mask,  # bs, 195
-            "position_ids": position_ids,  # bs, 195
-            "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
-        }
+            text_dict = main_text_dict
 
         # import ipdb; ipdb.set_trace()
         if isinstance(samples, (list, torch.Tensor)):

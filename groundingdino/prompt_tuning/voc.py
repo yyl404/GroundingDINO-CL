@@ -36,6 +36,28 @@ def build_caption(classes: List[str]) -> str:
     return " . ".join(classes) + " ."
 
 
+def normalize_pose_text(pose: str) -> str:
+    if pose is None:
+        return "unspecified"
+    pose = str(pose).strip().lower()
+    if not pose:
+        return "unspecified"
+    return pose.replace("_", " ")
+
+
+def build_aux_caption(aux_terms: List[str]) -> str:
+    normalized = [normalize_pose_text(x) for x in aux_terms if str(x).strip()]
+    if not normalized:
+        normalized = ["unspecified"]
+    deduped = []
+    seen = set()
+    for item in normalized:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return " . ".join(deduped) + " ."
+
+
 def build_domain_category_name(category_name: str, domain: str) -> str:
     return f"{domain}:{category_name}"
 
@@ -70,7 +92,7 @@ def get_split_present_class_names(voc_root: str, split: str, classes: List[str] 
         anno_path = os.path.join(annotations_dir, f"{image_id}.xml")
         if not os.path.exists(anno_path):
             continue
-        _boxes, labels, _difficult_flags = _parse_voc_annotation(
+        _boxes, labels, _difficult_flags, _poses = _parse_voc_annotation(
             anno_path, class_to_id=class_to_id, keep_difficult=True
         )
         for label in labels:
@@ -85,6 +107,7 @@ def _parse_voc_annotation(xml_path: str, class_to_id: Dict[str, int], keep_diffi
     boxes = []
     labels = []
     difficult_flags = []
+    poses = []
 
     for obj in root.findall("object"):
         name_node = obj.find("name")
@@ -109,11 +132,14 @@ def _parse_voc_annotation(xml_path: str, class_to_id: Dict[str, int], keep_diffi
         if xmax <= xmin or ymax <= ymin:
             continue
 
+        pose_node = obj.find("pose")
+        pose = normalize_pose_text(pose_node.text if pose_node is not None else "")
         boxes.append([xmin, ymin, xmax, ymax])
         labels.append(class_to_id[class_name])
         difficult_flags.append(difficult)
+        poses.append(pose)
 
-    return boxes, labels, difficult_flags
+    return boxes, labels, difficult_flags, poses
 
 
 def build_class_token_map(tokenizer, classes: List[str]) -> Dict[int, List[int]]:
@@ -190,7 +216,7 @@ class VOCDataset(Dataset):
 
         image = Image.open(image_path).convert("RGB")
         width, height = image.size
-        boxes, labels, difficult_flags = _parse_voc_annotation(
+        boxes, labels, difficult_flags, poses = _parse_voc_annotation(
             anno_path, self.class_to_id, self.keep_difficult
         )
 
@@ -203,6 +229,7 @@ class VOCDataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.int64),
             "iscrowd": torch.zeros((len(boxes),), dtype=torch.int64),
             "difficult": torch.tensor(difficult_flags, dtype=torch.int64),
+            "poses": poses,
             "image_name": image_id,
         }
         if len(boxes) > 0:

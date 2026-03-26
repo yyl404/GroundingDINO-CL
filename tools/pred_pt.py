@@ -21,10 +21,12 @@ from groundingdino.prompt_tuning.predictor import (
 from groundingdino.prompt_tuning.voc import (
     VOC_CLASSES,
     VOCDataset,
+    build_aux_caption,
     build_caption,
     build_class_token_map,
     build_domain_category_name,
     get_split_present_class_names,
+    normalize_pose_text,
 )
 
 
@@ -65,6 +67,17 @@ def parse_args():
         help="VOC split for test mode.",
     )
     parser.add_argument("--prompt_length", type=int, default=16, help="Prompt length (must match training).")
+    parser.add_argument(
+        "--dual_prompt",
+        action="store_true",
+        help="Enable dual-prompt text encoding with auxiliary prompts.",
+    )
+    parser.add_argument(
+        "--aux_prompts",
+        nargs="*",
+        default=[],
+        help="Auxiliary prompt candidates for inference mode (e.g. left right frontal).",
+    )
     parser.add_argument(
         "--image_exts",
         nargs="+",
@@ -115,6 +128,68 @@ def _build_token_prompt_map_from_metadata(metadata: Dict, class_token_map: Dict[
         for token_id in class_token_map[class_id]:
             token_to_prompt_idx[token_id] = int(prompt_idx)
     return token_to_prompt_idx
+
+
+def _build_phrase_spans(tokenizer, caption: str, phrases: List[str]) -> List[List[int]]:
+    caption_ids = tokenizer(caption, add_special_tokens=True)["input_ids"]
+    spans = []
+    cursor = 0
+    for phrase in phrases:
+        phrase_ids = tokenizer(phrase, add_special_tokens=False)["input_ids"]
+        if not phrase_ids:
+            spans.append([])
+            continue
+        found = []
+        for start in range(cursor, len(caption_ids) - len(phrase_ids) + 1):
+            if caption_ids[start : start + len(phrase_ids)] == phrase_ids:
+                found = list(range(start, start + len(phrase_ids)))
+                cursor = start + len(phrase_ids)
+                break
+        spans.append(found)
+    return spans
+
+
+def _build_dual_combo_prompts(tokenizer, classes: List[str], aux_candidates: List[str]):
+    normalized_aux = [normalize_pose_text(x) for x in aux_candidates if str(x).strip()]
+    unique_aux = []
+    for pose in normalized_aux:
+        if pose not in unique_aux:
+            unique_aux.append(pose)
+    if "none" not in unique_aux:
+        unique_aux.append("none")
+
+    combo_class_ids = []
+    main_terms = []
+    aux_terms = []
+    for class_id, class_name in enumerate(classes):
+        for aux in unique_aux:
+            combo_class_ids.append(class_id)
+            main_terms.append(class_name)
+            aux_terms.append(aux)
+
+    main_caption = build_caption(main_terms)
+    aux_caption = build_aux_caption(aux_terms)
+    spans = _build_phrase_spans(tokenizer, main_caption, main_terms)
+    class_token_map = {class_id: [] for class_id in range(len(classes))}
+    for class_id, token_span in zip(combo_class_ids, spans):
+        class_token_map[class_id].extend(token_span)
+    return main_caption, aux_caption, class_token_map, unique_aux
+
+
+def _build_aux_token_map(tokenizer, aux_caption: str, pose_to_idx: Dict[str, int], max_text_len: int) -> torch.Tensor:
+    token_map = torch.full((max_text_len,), -1, dtype=torch.long)
+    caption_ids = tokenizer(aux_caption, add_special_tokens=True)["input_ids"][:max_text_len]
+    for pose, pose_idx in pose_to_idx.items():
+        pose_ids = tokenizer(pose, add_special_tokens=False)["input_ids"]
+        if not pose_ids:
+            continue
+        for start in range(len(caption_ids) - len(pose_ids) + 1):
+            if caption_ids[start : start + len(pose_ids)] == pose_ids:
+                for token_pos in range(start, start + len(pose_ids)):
+                    if token_pos < max_text_len:
+                        token_map[token_pos] = int(pose_idx)
+                break
+    return token_map
 
 
 def build_infer_transform():
@@ -168,7 +243,7 @@ def list_images(input_path: str, image_exts: List[str]) -> List[str]:
     raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
 
-def run_inference_mode(args, model, class_token_map):
+def run_inference_mode(args, model, class_token_map, aux_pose_to_idx: Dict[str, int]):
     os.makedirs(args.output_dir, exist_ok=True)
     vis_dir = os.path.join(args.output_dir, "vis")
     txt_dir = os.path.join(args.output_dir, "txt")
@@ -179,6 +254,26 @@ def run_inference_mode(args, model, class_token_map):
 
     transform = build_infer_transform()
     caption = build_caption(VOC_CLASSES)
+    aux_caption = ""
+    class_token_map_infer = class_token_map
+    aux_prompt_token_map_override = None
+    if args.dual_prompt:
+        caption, aux_caption, class_token_map_infer, used_aux = _build_dual_combo_prompts(
+            tokenizer=model.tokenizer,
+            classes=VOC_CLASSES,
+            aux_candidates=args.aux_prompts,
+        )
+        if aux_pose_to_idx:
+            aux_prompt_token_map_override = _build_aux_token_map(
+                tokenizer=model.tokenizer,
+                aux_caption=aux_caption,
+                pose_to_idx=aux_pose_to_idx,
+                max_text_len=model.max_text_len,
+            )
+        print(
+            f"Dual-prompt inference enabled: classes={len(VOC_CLASSES)}, "
+            f"aux_candidates_with_none={len(used_aux)}, total_combinations={len(VOC_CLASSES) * len(used_aux)}"
+        )
     image_paths = list_images(args.input, args.image_exts)
     if not image_paths:
         print("No images found for inference.")
@@ -189,12 +284,18 @@ def run_inference_mode(args, model, class_token_map):
         image_rgb, image_tensor = read_image_for_model(image_path, transform)
         image_tensor = image_tensor.to(args.device)
         with torch.no_grad():
-            outputs = model(image_tensor[None], captions=[caption])
+            if args.dual_prompt:
+                model_kwargs = {"captions": [caption], "aux_captions": [aux_caption]}
+                if aux_prompt_token_map_override is not None:
+                    model_kwargs["aux_prompt_token_map_override"] = aux_prompt_token_map_override
+                outputs = model(image_tensor[None], **model_kwargs)
+            else:
+                outputs = model(image_tensor[None], captions=[caption])
 
         h, w = image_rgb.shape[:2]
         boxes_cxcywh, scores, class_ids = decode_predictions(
             outputs=outputs,
-            class_token_map=class_token_map,
+            class_token_map=class_token_map_infer,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
             num_classes=len(VOC_CLASSES),
@@ -213,7 +314,13 @@ def run_inference_mode(args, model, class_token_map):
         print(f"Inference done: {image_path}, detections={len(scores)}")
 
 
-def run_test_mode(args, model, class_token_map, eval_class_ids: List[int]):
+def run_test_mode(
+    args,
+    model,
+    class_token_map,
+    eval_class_ids: List[int],
+    aux_pose_to_idx: Dict[str, int],
+):
     os.makedirs(args.output_dir, exist_ok=True)
     caption = build_caption(VOC_CLASSES)
     transform = build_infer_transform()
@@ -238,13 +345,31 @@ def run_test_mode(args, model, class_token_map, eval_class_ids: List[int]):
         image_tensor = image_tensor.to(args.device)
 
         with torch.no_grad():
-            outputs = model(image_tensor[None], captions=[caption])
+            class_token_map_eval = class_token_map
+            if args.dual_prompt:
+                target_poses = [normalize_pose_text(x) for x in target.get("poses", [])]
+                caption_eval, aux_caption_eval, class_token_map_eval, _ = _build_dual_combo_prompts(
+                    tokenizer=model.tokenizer,
+                    classes=VOC_CLASSES,
+                    aux_candidates=target_poses,
+                )
+                model_kwargs = {"captions": [caption_eval], "aux_captions": [aux_caption_eval]}
+                if aux_pose_to_idx:
+                    model_kwargs["aux_prompt_token_map_override"] = _build_aux_token_map(
+                        tokenizer=model.tokenizer,
+                        aux_caption=aux_caption_eval,
+                        pose_to_idx=aux_pose_to_idx,
+                        max_text_len=model.max_text_len,
+                    )
+                outputs = model(image_tensor[None], **model_kwargs)
+            else:
+                outputs = model(image_tensor[None], captions=[caption])
 
         orig_h = int(target["orig_size"][0].item())
         orig_w = int(target["orig_size"][1].item())
         boxes_cxcywh, scores, class_ids = decode_predictions(
             outputs=outputs,
-            class_token_map=class_token_map,
+            class_token_map=class_token_map_eval,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
             num_classes=len(VOC_CLASSES),
@@ -292,6 +417,7 @@ def main():
 
     metadata = {}
     learned_class_ids = set(range(len(VOC_CLASSES)))
+    aux_pose_to_idx: Dict[str, int] = {}
     if args.prompt_path:
         prompt_state, metadata = _load_prompt_checkpoint(args.prompt_path)
         prompt_mode = _infer_prompt_mode(prompt_state, metadata)
@@ -314,10 +440,21 @@ def main():
         extracted = _extract_learned_class_ids(metadata)
         if extracted is not None:
             learned_class_ids = extracted
+        pose_vocab = metadata.get("pose_vocabulary", []) or []
+        aux_pose_to_idx = {normalize_pose_text(x): idx for idx, x in enumerate(pose_vocab)}
         print(f"Loaded prompt weights from: {args.prompt_path}")
         print(f"Prompt mode inferred from checkpoint: {_infer_prompt_mode(prompt_state, metadata)}")
     else:
         model.init_prompt_tuning(prompt_length=args.prompt_length, mode="shared")
+        if args.dual_prompt:
+            # Fallback initialization for dual inference without prompt checkpoint.
+            model.init_aux_prompt_tuning(prompt_length=args.prompt_length, mode="shared")
+
+    if args.dual_prompt and model.aux_prompt_embeddings is None:
+        if aux_pose_to_idx:
+            model.init_aux_prompt_tuning(num_embeddings=len(aux_pose_to_idx), mode="class_independent")
+        else:
+            model.init_aux_prompt_tuning(prompt_length=args.prompt_length, mode="shared")
 
     model.to(args.device)
 
@@ -335,9 +472,15 @@ def main():
         if not eval_class_ids:
             print("[Warning] No overlap between learned classes and dataset classes; skip mAP evaluation.")
             return
-        run_test_mode(args, model, class_token_map, eval_class_ids=eval_class_ids)
+        run_test_mode(
+            args,
+            model,
+            class_token_map,
+            eval_class_ids=eval_class_ids,
+            aux_pose_to_idx=aux_pose_to_idx,
+        )
     else:
-        run_inference_mode(args, model, class_token_map)
+        run_inference_mode(args, model, class_token_map, aux_pose_to_idx=aux_pose_to_idx)
 
 
 if __name__ == "__main__":
