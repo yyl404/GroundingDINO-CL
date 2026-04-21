@@ -144,3 +144,12 @@ grounding/version.py
 
 vis/
 tmp/
+
+data
+data/
+bert-base-uncased
+bert-base-uncased/
+weights
+weights/
+outputs
+outputs/
