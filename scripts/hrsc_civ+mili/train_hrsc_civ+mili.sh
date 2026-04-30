@@ -25,6 +25,7 @@ for idx in "${!TASK_DATASETS[@]}"; do
     --lr 1e-4
     --output_dir "$output_dir"
     --inject_before_encoder
+    --use_lora
   )
 
   if [ "$task_id" -gt 1 ]; then

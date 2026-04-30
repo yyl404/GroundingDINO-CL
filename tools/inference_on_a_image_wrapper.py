@@ -1,6 +1,16 @@
 import argparse
 import os
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import warnings
+from quiet_warnings import silence_known_training_warnings
+
+silence_known_training_warnings()
 
 import numpy as np
 import torch
@@ -12,7 +22,13 @@ from groundingdino.util.utils import get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
 
 from finetune import GroundingDINOWrapper
-from utils import load_model, load_wrapper_checkpoint, xywhr_to_corners_xyxyxyxy
+from utils import (
+    configure_model_trainable_flags,
+    load_model,
+    load_wrapper_checkpoint,
+    parse_lora_layers,
+    xywhr_to_corners_xyxyxyxy,
+)
 
 
 def plot_boxes_to_image(image_pil, tgt):
@@ -144,6 +160,22 @@ if __name__ == "__main__":
         action="store_true",
         help="whether to inject learnable class embeddings before text encoder",
     )
+    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora_targets",
+        type=str,
+        default="value_proj,output_proj,linear1,linear2",
+        help="Comma-separated module-name keywords to select base nn.Linear layers for LoRA injection.",
+    )
+    parser.add_argument(
+        "--lora_layers",
+        type=str,
+        default="all",
+        help="Transformer layer indices for LoRA, e.g. '0,1,2'; use 'all' for all layers.",
+    )
     parser.add_argument("--cpu-only", action="store_true", help="running on cpu only!, default=False")
     parser.add_argument("--use_obb", action="store_true", help="Enable OBB output (xywhr) from wrapper.")
     args = parser.parse_args()
@@ -159,6 +191,10 @@ if __name__ == "__main__":
     aggregation_method = args.aggregation_method
     prompt_len = args.prompt_len
     inject_before_encoder = args.inject_before_encoder
+    lora_targets = [x.strip() for x in args.lora_targets.split(",") if x.strip()]
+    lora_layers = parse_lora_layers(args.lora_layers)
+    if not lora_targets:
+        raise ValueError("--lora_targets must include at least one non-empty target.")
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
@@ -175,7 +211,14 @@ if __name__ == "__main__":
                                  model=model,
                                  prompt_len=prompt_len,
                                  inject_before_encoder=inject_before_encoder,
-                                 use_obb=args.use_obb)
+                                 use_obb=args.use_obb,
+                                 use_lora=args.use_lora,
+                                 lora_r=args.lora_r,
+                                 lora_alpha=args.lora_alpha,
+                                 lora_dropout=args.lora_dropout,
+                                 lora_targets=lora_targets,
+                                 lora_layers=lora_layers)
+    configure_model_trainable_flags(model, use_lora=args.use_lora)
     if wrapper_checkpoint is not None:
         load_wrapper_checkpoint(
             model,

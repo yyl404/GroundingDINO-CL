@@ -1,9 +1,18 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import warnings
+from quiet_warnings import silence_known_training_warnings
+
+silence_known_training_warnings()
+
 import argparse
 import json
 import os
-import random
-import warnings
-from pathlib import Path
 from typing import Dict, List, Sequence
 
 import torch
@@ -16,10 +25,18 @@ from tqdm import tqdm
 from groundingdino.util.misc import NestedTensor
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import YoloOBBDataset, YoloDetectionDataset, _load_yolo_yaml, collate_fn, xyxyxyxy2xywhr
+from finetune.datasets.yolo import YoloOBBDataset, YoloDetectionDataset, collate_fn, xyxyxyxy2xywhr
 from finetune.eval import evaluate_detection, evaluate_obb
 from finetune.losses import wrapper_loss, wrapper_loss_obb
-from utils import load_model, load_wrapper_checkpoint
+from utils import (
+    configure_model_trainable_flags,
+    load_model,
+    load_wrapper_checkpoint,
+    parse_classes,
+    parse_lora_layers,
+    parse_lora_targets,
+    set_seed,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +62,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt_len", type=int, default=4)
     parser.add_argument("--inject_before_encoder", action="store_true")
     parser.add_argument("--aggregation_method", type=str, choices=["mean", "sum", "max", "min"], default="max")
+    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora_targets",
+        type=str,
+        default="value_proj,output_proj,linear1,linear2",
+        help="Comma-separated module-name keywords to select base nn.Linear layers for LoRA injection.",
+    )
+    parser.add_argument(
+        "--lora_layers",
+        type=str,
+        default="all",
+        help="Transformer layer indices for LoRA, e.g. '0,1,2'; use 'all' for all layers.",
+    )
 
     parser.add_argument("--eval_iou_threshold", type=float, default=0.5)
     parser.add_argument("--eval_ap_score_threshold", type=float, default=1e-3)
@@ -54,25 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load_wrapper", type=str, default=None, help="Path to wrapper checkpoint")
     parser.add_argument("--resume", action="store_true", help="If set, also restore optimizer/epoch state from --load_wrapper.")
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def parse_classes(classes_arg: str | None, dataset_yaml: str) -> List[str]:
-    if classes_arg:
-        classes = [c.strip() for c in classes_arg.split(",") if c.strip()]
-        if not classes:
-            raise ValueError("--classes must be non-empty when provided.")
-        return classes
-    cfg = _load_yolo_yaml(dataset_yaml)
-    if not cfg["class_names"]:
-        raise ValueError("No classes in dataset yaml. Please set --classes explicitly.")
-    return cfg["class_names"]
-
 
 def move_targets_to_device(targets: Sequence[Dict[str, Tensor]], device: torch.device) -> List[Dict[str, Tensor]]:
     out: List[Dict[str, Tensor]] = []
@@ -96,6 +110,13 @@ def save_checkpoint(
         "wrapper_kwargs": {
             "prompt_len": args.prompt_len if args else None,
             "inject_before_encoder": args.inject_before_encoder if args else None,
+            "use_obb": args.use_obb if args else None,
+            "use_lora": args.use_lora if args else None,
+            "lora_r": args.lora_r if args else None,
+            "lora_alpha": args.lora_alpha if args else None,
+            "lora_dropout": args.lora_dropout if args else None,
+            "lora_targets": parse_lora_targets(args.lora_targets) if args else None,
+            "lora_layers": parse_lora_layers(args.lora_layers) if args else None,
         },
         "wrapper_state_dict": {k: v.detach().cpu() for k, v in wrapper.state_dict().items()},
         "optimizer": optimizer.state_dict() if optimizer else None,
@@ -148,7 +169,16 @@ def train_one_epoch(
         for key, value in loss_dict.items():
             running[key] = running.get(key, 0.0) + float(value.detach().item())
         averages = {k: v / step for k, v in running.items()}
-        pbar.set_postfix({k: f"{v:.4f}" for k, v in averages.items()})
+        postfix: Dict[str, str] = {k: f"{v:.4f}" for k, v in averages.items()}
+        if device.type == "cuda" and torch.cuda.is_available():
+            cuda_index = device.index if device.index is not None else torch.cuda.current_device()
+            free_b, total_b = torch.cuda.mem_get_info(cuda_index)
+            used_b = total_b - free_b
+            gib = 1024.0**3
+            used_gib = used_b / gib
+            total_gib = total_b / gib
+            postfix["VRAM"] = f"{used_gib:.2f}/{total_gib:.2f}GiB"
+        pbar.set_postfix(postfix)
 
     return {k: v / max(len(train_loader), 1) for k, v in running.items()}
 
@@ -165,6 +195,8 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     classes = parse_classes(args.classes, args.dataset_yaml)
+    lora_targets = parse_lora_targets(args.lora_targets)
+    lora_layers = parse_lora_layers(args.lora_layers)
     (log_dir / "train_args.json").write_text(
         json.dumps({**vars(args), "resolved_classes": classes}, indent=2),
         encoding="utf-8",
@@ -243,7 +275,14 @@ def main() -> None:
         prompt_len=args.prompt_len,
         inject_before_encoder=args.inject_before_encoder,
         use_obb=args.use_obb,
+        use_lora=args.use_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_targets=lora_targets,
+        lora_layers=lora_layers,
     ).to(device)
+    configure_model_trainable_flags(wrapper, use_lora=args.use_lora)
     checkpoint = None
     if args.load_wrapper:
         checkpoint = torch.load(args.load_wrapper, map_location="cpu")
@@ -252,11 +291,11 @@ def main() -> None:
     if args.resume and checkpoint is None:
         raise ValueError("--resume requires --load_wrapper to provide the checkpoint path.")
 
-    trainable_params = [
-        p
-        for name, p in wrapper.named_parameters()
-        if p.requires_grad and not name.startswith("model.")
-    ]
+    trainable = [(n, p) for n, p in wrapper.named_parameters() if p.requires_grad]
+    trainable_params = [p for _, p in trainable]
+    print(f"Trainable parameters ({len(trainable)}):")
+    for name, _ in trainable:
+        print(f"  {name}")
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     start_epoch = 1

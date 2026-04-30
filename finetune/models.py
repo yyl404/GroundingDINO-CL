@@ -1,6 +1,7 @@
 import warnings
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 import math
+import re
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,37 @@ from groundingdino.models.GroundingDINO.groundingdino import GroundingDINO
 from groundingdino.models.GroundingDINO.utils import MLP
 from groundingdino.util.vl_utils import create_positive_map_from_span
 from groundingdino.util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list
+
+
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        base: nn.Linear,
+        r: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if r <= 0:
+            raise ValueError(f"LoRA rank `r` must be positive, got {r}.")
+        self.base = base
+        self.r = int(r)
+        self.scaling = float(alpha) / float(r)
+        self.dropout = nn.Dropout(float(dropout)) if dropout > 0.0 else nn.Identity()
+
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+        self.lora_A = nn.Parameter(torch.zeros(self.r, base.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, self.r))
+        # nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base_out = self.base(x)
+        lora_out = (self.dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        return base_out + lora_out * self.scaling
 
 
 def segment_text_to_word_embeddings(
@@ -33,12 +65,24 @@ class GroundingDINOWrapper(nn.Module):
         prompt_len=4,
         inject_before_encoder=True,
         use_obb=False,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.05,
+        lora_targets: Sequence[str] = ("value_proj", "output_proj", "linear1", "linear2"),
+        lora_layers: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.classes = classes
         self.prompt_len=prompt_len
         self.inject_before_encoder = inject_before_encoder
+        self.use_lora = use_lora
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_targets = tuple(lora_targets)
+        self.lora_layers = None if lora_layers is None else tuple(sorted({int(i) for i in lora_layers}))
         self._init_embeddings()
 
         hidden_dim = self.model.hidden_dim
@@ -52,6 +96,9 @@ class GroundingDINOWrapper(nn.Module):
         self.use_obb = use_obb
         if use_obb:
             self.angle_head = MLP(hidden_dim, hidden_dim, 1, 3)
+
+        if self.use_lora:
+            self._inject_lora_into_model()
 
     def _build_cls_head(self, num_classes: int, device=None, dtype=None):
         hidden_dim = self.model.hidden_dim
@@ -69,6 +116,61 @@ class GroundingDINOWrapper(nn.Module):
     def _zero_init_module(module: nn.Module) -> None:
         for p in module.parameters():
             nn.init.zeros_(p)
+
+    def _inject_lora_into_model(self) -> None:
+        if not self.lora_targets:
+            raise ValueError("`lora_targets` cannot be empty when use_lora=True.")
+
+        replaced_count = 0
+        module_names = [name for name, _ in self.model.named_modules()]
+        for module_name in module_names:
+            if not module_name:
+                continue
+            parent_name, child_name = module_name.rsplit(".", 1) if "." in module_name else ("", module_name)
+            parent = self.model.get_submodule(parent_name) if parent_name else self.model
+            child = getattr(parent, child_name)
+            if isinstance(child, LoRALinear):
+                continue
+            if not isinstance(child, nn.Linear):
+                continue
+            if not any(target in module_name for target in self.lora_targets):
+                continue
+            if not self._is_in_selected_lora_layers(module_name):
+                continue
+            setattr(
+                parent,
+                child_name,
+                LoRALinear(
+                    child,
+                    r=self.lora_r,
+                    alpha=self.lora_alpha,
+                    dropout=self.lora_dropout,
+                ),
+            )
+            replaced_count += 1
+
+        if replaced_count == 0:
+            warnings.warn(
+                "LoRA is enabled but no Linear layers matched "
+                f"targets={self.lora_targets}, layers={self.lora_layers}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def _is_in_selected_lora_layers(self, module_name: str) -> bool:
+        if self.lora_layers is None:
+            return True
+
+        patterns = (
+            r"transformer\.encoder\.layers\.(\d+)\.",
+            r"transformer\.encoder\.text_layers\.(\d+)\.",
+            r"transformer\.decoder\.layers\.(\d+)\.",
+        )
+        for pattern in patterns:
+            m = re.search(pattern, module_name)
+            if m:
+                return int(m.group(1)) in self.lora_layers
+        return False
 
     def _init_embeddings(self) -> None:
         prompt_len = self.prompt_len

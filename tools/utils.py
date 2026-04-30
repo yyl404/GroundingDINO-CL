@@ -9,6 +9,51 @@ from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict
 
 from finetune import GroundingDINOWrapper
+from finetune.datasets.yolo import _load_yolo_yaml
+
+
+def set_seed(seed: int) -> None:
+    import random
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def parse_classes(classes_arg: str | None, dataset_yaml: str) -> List[str]:
+    if classes_arg:
+        classes = [c.strip() for c in classes_arg.split(",") if c.strip()]
+        if not classes:
+            raise ValueError("--classes must be non-empty when provided.")
+        return classes
+    cfg = _load_yolo_yaml(dataset_yaml)
+    if not cfg["class_names"]:
+        raise ValueError("No classes in dataset yaml. Please set --classes explicitly.")
+    return cfg["class_names"]
+
+
+def parse_lora_targets(raw: str) -> List[str]:
+    targets = [x.strip() for x in raw.split(",") if x.strip()]
+    if not targets:
+        raise ValueError("--lora_targets must include at least one non-empty target.")
+    return targets
+
+
+def parse_lora_layers(raw: str) -> list[int] | None:
+    value = raw.strip().lower()
+    if value in {"", "all"}:
+        return None
+    layers = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
+    if not layers:
+        raise ValueError("--lora_layers must be 'all' or a comma-separated list of integers.")
+    if any(x < 0 for x in layers):
+        raise ValueError("--lora_layers cannot contain negative indices.")
+    return layers
+
+
+def configure_model_trainable_flags(wrapper: GroundingDINOWrapper, use_lora: bool) -> None:
+    for name, p in wrapper.model.named_parameters():
+        p.requires_grad = bool(use_lora and ("lora_A" in name or "lora_B" in name))
 
 
 def xywhr_to_corners_xyxyxyxy(boxes_xywhr: torch.Tensor, width: float, height: float) -> torch.Tensor:
@@ -44,7 +89,7 @@ def load_model(model_config_path, model_checkpoint_path, device="cuda"):
     args = SLConfig.fromfile(model_config_path)
     args.device = str(device)
     model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
     load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     print(load_res)
     _ = model.eval()
@@ -163,3 +208,6 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
         # print("\n".join(f"  - {msg}" for msg in skipped_keys))
 
     return wrapper
+
+
+from quiet_warnings import silence_known_training_warnings  # noqa: E402  # re-export

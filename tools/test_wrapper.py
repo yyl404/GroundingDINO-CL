@@ -1,9 +1,18 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import warnings
+from quiet_warnings import silence_known_training_warnings
+
+silence_known_training_warnings()
+
 import argparse
 import json
 import os
-import random
-import warnings
-from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -19,12 +28,20 @@ from finetune import GroundingDINOWrapper
 from finetune.datasets.yolo import (
     YoloDetectionDataset,
     YoloOBBDataset,
-    _load_yolo_yaml,
     collate_fn,
     xyxyxyxy2xywhr,
 )
 from finetune.eval import evaluate_detection, evaluate_obb
-from utils import load_model, load_wrapper_checkpoint, xywhr_to_corners_xyxyxyxy
+from utils import (
+    configure_model_trainable_flags,
+    load_model,
+    load_wrapper_checkpoint,
+    parse_classes,
+    parse_lora_layers,
+    parse_lora_targets,
+    set_seed,
+    xywhr_to_corners_xyxyxyxy,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +101,22 @@ def parse_args() -> argparse.Namespace:
         default="max",
         help="Token aggregation for wrapper forward; should match training/eval settings.",
     )
+    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora_targets",
+        type=str,
+        default="value_proj,output_proj,linear1,linear2",
+        help="Comma-separated module-name keywords to select base nn.Linear layers for LoRA injection.",
+    )
+    parser.add_argument(
+        "--lora_layers",
+        type=str,
+        default="all",
+        help="Transformer layer indices for LoRA, e.g. '0,1,2'; use 'all' for all layers.",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save test logs.")
     parser.add_argument("--weight", type=str, default=None, help="Path to wrapper checkpoint file for evaluation.")
     parser.add_argument(
@@ -95,25 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-shot", action="store_true", help="Switch on to use zero-shot mode to infer")
     parser.add_argument("--use_obb", action="store_true", help="Enable OBB evaluation and visualization.")
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def parse_classes(classes_arg: str | None, dataset_yaml: str) -> List[str]:
-    if classes_arg:
-        classes = [c.strip() for c in classes_arg.split(",") if c.strip()]
-        if not classes:
-            raise ValueError("--classes must be non-empty when provided.")
-        return classes
-    cfg = _load_yolo_yaml(dataset_yaml)
-    if not cfg["class_names"]:
-        raise ValueError("No classes in dataset yaml. Please set --classes explicitly.")
-    return cfg["class_names"]
-
 
 def _to_pil_image_from_normalized_chw(img_chw: torch.Tensor) -> Image.Image:
     mean = torch.tensor([0.485, 0.456, 0.406], dtype=img_chw.dtype, device=img_chw.device).view(3, 1, 1)
@@ -300,6 +314,8 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     classes = parse_classes(args.classes, args.dataset_yaml)
+    lora_targets = parse_lora_targets(args.lora_targets)
+    lora_layers = parse_lora_layers(args.lora_layers)
     (log_dir / "train_args.json").write_text(
         json.dumps({**vars(args), "resolved_classes": classes}, indent=2),
         encoding="utf-8",
@@ -351,7 +367,14 @@ def main() -> None:
         prompt_len=args.prompt_len,
         inject_before_encoder=args.inject_before_encoder,
         use_obb=args.use_obb,
+        use_lora=args.use_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_targets=lora_targets,
+        lora_layers=lora_layers,
     ).to(device)
+    configure_model_trainable_flags(wrapper, use_lora=args.use_lora)
     if args.weight is not None:
         weight_ckpt = torch.load(args.weight, map_location="cpu")
         load_wrapper_checkpoint(wrapper, weight_ckpt, device=device)
