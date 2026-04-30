@@ -11,6 +11,35 @@ from groundingdino.util.utils import clean_state_dict
 from finetune import GroundingDINOWrapper
 
 
+def xywhr_to_corners_xyxyxyxy(boxes_xywhr: torch.Tensor, width: float, height: float) -> torch.Tensor:
+    """Convert normalized xywhr boxes to pixel-space corners [N, 8]."""
+    if boxes_xywhr.numel() == 0:
+        return boxes_xywhr.new_zeros((0, 8))
+    cx = boxes_xywhr[:, 0] * width
+    cy = boxes_xywhr[:, 1] * height
+    bw = boxes_xywhr[:, 2] * width
+    bh = boxes_xywhr[:, 3] * height
+    theta = boxes_xywhr[:, 4]
+
+    dx = bw * 0.5
+    dy = bh * 0.5
+    local = torch.tensor(
+        [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]],
+        dtype=boxes_xywhr.dtype,
+        device=boxes_xywhr.device,
+    ).unsqueeze(0)
+    local[..., 0] *= dx.unsqueeze(1)
+    local[..., 1] *= dy.unsqueeze(1)
+
+    cos_t = torch.cos(theta).unsqueeze(1)
+    sin_t = torch.sin(theta).unsqueeze(1)
+    rot_x = local[..., 0] * cos_t - local[..., 1] * sin_t
+    rot_y = local[..., 0] * sin_t + local[..., 1] * cos_t
+    x = rot_x + cx.unsqueeze(1)
+    y = rot_y + cy.unsqueeze(1)
+    return torch.stack((x, y), dim=-1).reshape(-1, 8)
+
+
 def load_model(model_config_path, model_checkpoint_path, device="cuda"):
     args = SLConfig.fromfile(model_config_path)
     args.device = str(device)

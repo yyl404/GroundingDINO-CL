@@ -1,5 +1,6 @@
 import warnings
 from typing import Dict, List, Tuple, Union
+import math
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +31,8 @@ class GroundingDINOWrapper(nn.Module):
         model: GroundingDINO,
         classes: List[str],
         prompt_len=4,
-        inject_before_encoder=True
+        inject_before_encoder=True,
+        use_obb=False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -46,6 +48,10 @@ class GroundingDINOWrapper(nn.Module):
         num_classes = len(classes)
         self.cls_head = self._build_cls_head(num_classes)
         self._zero_init_module(self.cls_head)
+
+        self.use_obb = use_obb
+        if use_obb:
+            self.angle_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
     def _build_cls_head(self, num_classes: int, device=None, dtype=None):
         hidden_dim = self.model.hidden_dim
@@ -398,12 +404,20 @@ class GroundingDINOWrapper(nn.Module):
             zip(reference[:-1], model.bbox_embed, hs)
         ):
             layer_delta_unsig = layer_bbox_embed(layer_hs)
-            # if dec_lid == len(hs) - 1:  # apply extra bbox refinement on the final decoder layer
-            #     layer_delta_unsig += self.bbox_embed_last_layer(layer_hs)
+            if dec_lid == len(hs) - 1:  # apply extra bbox refinement on the final decoder layer
+                layer_delta_unsig += self.bbox_embed_last_layer(layer_hs)
             layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
             layer_outputs_unsig = layer_outputs_unsig.sigmoid()
             outputs_coord_list.append(layer_outputs_unsig)
         outputs_coord_list = torch.stack(outputs_coord_list)
+
+        # predict angle for obb
+        if self.use_obb:
+            angle = self.angle_head(hs[-1]) # bs, 1
+            angle = (torch.sigmoid(angle) - 0.25) * math.pi # [-1/4 pi, 3/4 pi]
+            pred_boxes = torch.concat([outputs_coord_list[-1], angle], dim=2)
+        else:
+            pred_boxes = outputs_coord_list[-1]
 
         # output
         outputs_class = torch.stack(
@@ -417,7 +431,7 @@ class GroundingDINOWrapper(nn.Module):
                            device=delta_class_logits_unsig.device,
                            dtype=torch.long)
         delta_class_logits_unsig = delta_class_logits_unsig.index_select(-1, cid)
-        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": pred_boxes}
 
         # # for intermediate outputs
         # if model.aux_loss:

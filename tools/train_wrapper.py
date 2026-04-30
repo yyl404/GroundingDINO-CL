@@ -14,12 +14,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from groundingdino.util.misc import NestedTensor
-import groundingdino.datasets.transforms as T
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import YoloDetectionDataset, _load_yolo_yaml, collate_fn
-from finetune.eval import evaluate_detection
-from finetune.losses import wrapper_loss
+from finetune.datasets.yolo import YoloOBBDataset, YoloDetectionDataset, _load_yolo_yaml, collate_fn, xyxyxyxy2xywhr
+from finetune.eval import evaluate_detection, evaluate_obb
+from finetune.losses import wrapper_loss, wrapper_loss_obb
 from utils import load_model, load_wrapper_checkpoint
 
 
@@ -29,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained_checkpoint", type=str, required=True, help="GroundingDINO checkpoint path")
     parser.add_argument("--dataset_yaml", type=str, required=True, help="YOLO dataset yaml path")
     parser.add_argument("--classes", type=str, default=None, help='Comma-separated classes. If omitted, use dataset yaml "names".')
+    parser.add_argument("--use-obb", action="store_true")
 
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="val")
@@ -120,6 +120,13 @@ def train_one_epoch(
     for step, (images, targets) in enumerate(pbar, start=1):
         images = images.to(device)
         targets = move_targets_to_device(targets, device=device)
+        if args.use_obb:
+            converted_targets = []
+            for target in targets:
+                boxes = target.pop("boxes")
+                boxes_xywhr = xyxyxyxy2xywhr(boxes)
+                converted_targets.append({**target, "boxes": boxes_xywhr})
+            targets = converted_targets
 
         outputs = wrapper(
             images,
@@ -127,7 +134,10 @@ def train_one_epoch(
             aggregation_method=args.aggregation_method,
         )
 
-        loss_dict = wrapper_loss(outputs, targets)
+        if args.use_obb:
+            loss_dict = wrapper_loss_obb(outputs, targets)
+        else:
+            loss_dict = wrapper_loss(outputs, targets)
         
         optimizer.zero_grad()
         loss_dict["loss_total"].backward()
@@ -182,16 +192,28 @@ def main() -> None:
             TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    train_dataset = YoloDetectionDataset(
-        args.dataset_yaml,
-        split=args.train_split,
-        transform=train_transform,
-    )
-    val_dataset = YoloDetectionDataset(
-        args.dataset_yaml,
-        split=args.val_split,
-        transform=val_transform,
-    )
+    if args.use_obb:
+        train_dataset = YoloOBBDataset(
+            args.dataset_yaml,
+            split=args.train_split,
+            transform=train_transform,
+        )
+        val_dataset = YoloOBBDataset(
+            args.dataset_yaml,
+            split=args.val_split,
+            transform=val_transform,
+        )
+    else:
+        train_dataset = YoloDetectionDataset(
+            args.dataset_yaml,
+            split=args.train_split,
+            transform=train_transform,
+        )
+        val_dataset = YoloDetectionDataset(
+            args.dataset_yaml,
+            split=args.val_split,
+            transform=val_transform,
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -220,6 +242,7 @@ def main() -> None:
         classes=classes,
         prompt_len=args.prompt_len,
         inject_before_encoder=args.inject_before_encoder,
+        use_obb=args.use_obb,
     ).to(device)
     checkpoint = None
     if args.load_wrapper:
@@ -270,16 +293,28 @@ def main() -> None:
             wrapper=wrapper
         )
 
-        val_metrics = evaluate_detection(
-            wrapper,
-            val_loader,
-            classes,
-            device=device,
-            iou_threshold=args.eval_iou_threshold,
-            ap_score_threshold=args.eval_ap_score_threshold,
-            pr_score_threshold=args.eval_pr_score_threshold,
-            progress_desc=f"Eval Epoch {epoch}",
-        )
+        if args.use_obb:
+            val_metrics = evaluate_obb(
+                wrapper,
+                val_loader,
+                classes,
+                device=device,
+                iou_threshold=args.eval_iou_threshold,
+                ap_score_threshold=args.eval_ap_score_threshold,
+                pr_score_threshold=args.eval_pr_score_threshold,
+                progress_desc=f"Eval Epoch {epoch}",
+            )
+        else:
+            val_metrics = evaluate_detection(
+                wrapper,
+                val_loader,
+                classes,
+                device=device,
+                iou_threshold=args.eval_iou_threshold,
+                ap_score_threshold=args.eval_ap_score_threshold,
+                pr_score_threshold=args.eval_pr_score_threshold,
+                progress_desc=f"Eval Epoch {epoch}",
+            )
         val_log = {"epoch": epoch, "phase": "val", **val_metrics}
         with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(val_log, ensure_ascii=False) + "\n")

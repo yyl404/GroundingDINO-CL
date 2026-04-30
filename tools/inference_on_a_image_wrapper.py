@@ -12,7 +12,7 @@ from groundingdino.util.utils import get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
 
 from finetune import GroundingDINOWrapper
-from utils import load_model, load_wrapper_checkpoint
+from utils import load_model, load_wrapper_checkpoint, xywhr_to_corners_xyxyxyxy
 
 
 def plot_boxes_to_image(image_pil, tgt):
@@ -26,32 +26,48 @@ def plot_boxes_to_image(image_pil, tgt):
     mask_draw = ImageDraw.Draw(mask)
 
     # draw boxes and masks
-    for box, label in zip(boxes, labels):
-        # from 0..1 to 0..W, 0..H
-        box = box * torch.Tensor([W, H, W, H])
-        # from xywh to xyxy
-        box[:2] -= box[2:] / 2
-        box[2:] += box[:2]
-        # random color
-        color = tuple(np.random.randint(0, 255, size=3).tolist())
-        # draw
-        x0, y0, x1, y1 = box
-        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    if boxes.numel() > 0 and boxes.shape[-1] == 5:
+        corners = xywhr_to_corners_xyxyxyxy(boxes, float(W), float(H))
+        for corner, label in zip(corners, labels):
+            color = tuple(np.random.randint(0, 255, size=3).tolist())
+            pts = corner.reshape(4, 2).tolist()
+            draw.polygon([tuple(p) for p in pts], outline=color, width=6)
 
-        draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
-        # draw.text((x0, y0), str(label), fill=color)
+            x0, y0 = pts[0]
+            font = ImageFont.load_default()
+            if hasattr(font, "getbbox"):
+                bbox = draw.textbbox((x0, y0), str(label), font)
+            else:
+                w, h = draw.textsize(str(label), font)
+                bbox = (x0, y0, w + x0, y0 + h)
+            draw.rectangle(bbox, fill=color)
+            draw.text((x0, y0), str(label), fill="white")
+            mask_draw.polygon([tuple(p) for p in pts], fill=255)
+    else:
+        for box, label in zip(boxes, labels):
+            # from 0..1 to 0..W, 0..H
+            box = box * torch.Tensor([W, H, W, H])
+            # from xywh to xyxy
+            box[:2] -= box[2:] / 2
+            box[2:] += box[:2]
+            # random color
+            color = tuple(np.random.randint(0, 255, size=3).tolist())
+            # draw
+            x0, y0, x1, y1 = box
+            x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
 
-        font = ImageFont.load_default()
-        if hasattr(font, "getbbox"):
-            bbox = draw.textbbox((x0, y0), str(label), font)
-        else:
-            w, h = draw.textsize(str(label), font)
-            bbox = (x0, y0, w + x0, y0 + h)
-        # bbox = draw.textbbox((x0, y0), str(label))
-        draw.rectangle(bbox, fill=color)
-        draw.text((x0, y0), str(label), fill="white")
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
 
-        mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
+            font = ImageFont.load_default()
+            if hasattr(font, "getbbox"):
+                bbox = draw.textbbox((x0, y0), str(label), font)
+            else:
+                w, h = draw.textsize(str(label), font)
+                bbox = (x0, y0, w + x0, y0 + h)
+            draw.rectangle(bbox, fill=color)
+            draw.text((x0, y0), str(label), fill="white")
+
+            mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
 
     return image_pil, mask
 
@@ -80,7 +96,7 @@ def get_grounding_output(model, image, classes, box_threshold, aggregation_metho
         classes = model.classes
     with torch.no_grad():
         outputs = model(image[None], classes, aggregation_method=aggregation_method)
-    boxes = outputs["pred_boxes"][0]  # (nq, 4)
+    boxes = outputs["pred_boxes"][0]  # (nq, 4) or (nq, 5) for OBB
     class_logits = outputs["pred_class_logits"][0] # (nq, n_classes)
 
     # filter output
@@ -129,6 +145,7 @@ if __name__ == "__main__":
         help="whether to inject learnable class embeddings before text encoder",
     )
     parser.add_argument("--cpu-only", action="store_true", help="running on cpu only!, default=False")
+    parser.add_argument("--use_obb", action="store_true", help="Enable OBB output (xywhr) from wrapper.")
     args = parser.parse_args()
 
     # cfg
@@ -157,7 +174,8 @@ if __name__ == "__main__":
     model = GroundingDINOWrapper(classes=classes,
                                  model=model,
                                  prompt_len=prompt_len,
-                                 inject_before_encoder=inject_before_encoder)
+                                 inject_before_encoder=inject_before_encoder,
+                                 use_obb=args.use_obb)
     if wrapper_checkpoint is not None:
         load_wrapper_checkpoint(
             model,
