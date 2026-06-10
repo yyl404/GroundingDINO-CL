@@ -6,5 +6,5 @@ python tools/test_wrapper.py \
   --batch_size 4 \
   --output_dir outputs/test_wrapper_voc \
   --weight outputs/train_wrapper_voc/checkpoints/best_map50.pt \
-  --inject_before_encoder \
+  --text_mode prompt \
   --vis-batch 1

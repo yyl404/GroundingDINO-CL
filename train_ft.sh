@@ -7,4 +7,5 @@ python tools/train_wrapper.py \
   --batch_size 4 \
   --lr 1e-4 \
   --output_dir outputs/train_wrapper_voc \
-  --inject_before_encoder
+  --text_mode prompt \
+  --param_tune delta

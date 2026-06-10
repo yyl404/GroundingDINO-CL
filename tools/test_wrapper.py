@@ -25,13 +25,8 @@ import groundingdino.datasets.transforms as T
 from groundingdino.util import box_ops
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import (
-    YoloDetectionDataset,
-    YoloOBBDataset,
-    collate_fn,
-    xyxyxyxy2xywhr,
-)
-from finetune.eval import evaluate_detection, evaluate_obb
+from finetune.datasets.yolo import YoloDetectionDataset, collate_fn
+from finetune.eval import evaluate_detection
 from utils import (
     configure_model_trainable_flags,
     load_model,
@@ -40,7 +35,6 @@ from utils import (
     parse_lora_layers,
     parse_lora_targets,
     set_seed,
-    xywhr_to_corners_xyxyxyxy,
 )
 
 
@@ -65,6 +59,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader worker processes.")
     parser.add_argument("--device", type=str, default="cuda", help='Device string, e.g. "cuda", "cuda:0", or "cpu".')
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["prompt", "fixed"],
+        default="prompt",
+        help="Text input mode: 'prompt' for learnable prompt embeddings, 'fixed' for class-name captions.",
+    )
+    parser.add_argument(
+        "--param_tune",
+        type=str,
+        choices=["full", "lora", "delta", "frozen"],
+        default="delta",
+        help="Parameter tuning mode: full non-text, LoRA, output delta heads, or fully frozen.",
+    )
     parser.add_argument("--prompt_len", type=int, default=4, help="Prompt token length per class.")
     parser.add_argument(
         "--inject_before_encoder",
@@ -101,7 +109,6 @@ def parse_args() -> argparse.Namespace:
         default="max",
         help="Token aggregation for wrapper forward; should match training/eval settings.",
     )
-    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
@@ -124,9 +131,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to decode and output class embedding information.",
     )
-
-    parser.add_argument("--zero-shot", action="store_true", help="Switch on to use zero-shot mode to infer")
-    parser.add_argument("--use_obb", action="store_true", help="Enable OBB evaluation and visualization.")
     return parser.parse_args()
 
 def _to_pil_image_from_normalized_chw(img_chw: torch.Tensor) -> Image.Image:
@@ -171,44 +175,6 @@ def _draw_boxes(
     return vis
 
 
-def _draw_obb_boxes(
-    image: Image.Image,
-    boxes_xywhr: torch.Tensor,
-    labels: torch.Tensor,
-    classes: List[str],
-    image_size: tuple[int, int],
-    scores: torch.Tensor | None = None,
-) -> Image.Image:
-    vis = image.copy()
-    draw = ImageDraw.Draw(vis)
-    width, height = image_size
-    corners = xywhr_to_corners_xyxyxyxy(boxes_xywhr, float(width), float(height))
-
-    def _color_for_class(cls_id: int) -> tuple[int, int, int]:
-        rng = np.random.default_rng(cls_id + 1)
-        return tuple(int(x) for x in rng.integers(0, 255, size=3))
-
-    for i in range(int(corners.shape[0])):
-        pts = corners[i].reshape(4, 2).tolist()
-        cls_id = int(labels[i].item())
-        cls_name = classes[cls_id] if 0 <= cls_id < len(classes) else str(cls_id)
-        score_text = f"{float(scores[i].item()):.2f}" if scores is not None else "1.00"
-        text = f"{cls_name}({score_text})"
-        color = _color_for_class(cls_id)
-        draw.polygon([tuple(p) for p in pts], outline=color, width=6)
-
-        x0, y0 = pts[0]
-        font = ImageFont.load_default()
-        if hasattr(font, "getbbox"):
-            bbox = draw.textbbox((x0, y0), text, font)
-        else:
-            w, h = draw.textsize(text, font)
-            bbox = (x0, y0, w + x0, y0 + h)
-        draw.rectangle(bbox, fill=color)
-        draw.text((x0, y0), text, fill="white")
-    return vis
-
-
 @torch.no_grad()
 def visualize_batches(
     wrapper: GroundingDINOWrapper,
@@ -218,8 +184,6 @@ def visualize_batches(
     vis_batch: int,
     score_threshold: float,
     vis_dir: Path,
-    zero_shot: bool = False,
-    use_obb: bool = False,
     aggregation_method: str = "max",
 ) -> int:
     """Save visualization images for the first ``vis_batch`` batches. Returns number of images written."""
@@ -231,14 +195,9 @@ def visualize_batches(
     for batch_idx, (images, targets) in enumerate(data_loader):
         if batch_idx >= vis_batch:
             break
-        if zero_shot:
-            outputs = wrapper.forward_zeroshot(
-                images.to(device), classes=classes, aggregation_method=aggregation_method
-            )
-        else:
-            outputs = wrapper(
-                images.to(device), classes=classes, aggregation_method=aggregation_method
-            )
+        outputs = wrapper(
+            images.to(device), classes=classes, aggregation_method=aggregation_method
+        )
         pred_boxes_batch = outputs["pred_boxes"].detach().cpu()
         pred_cls_logits_batch = outputs["pred_class_logits"].detach().cpu()
         if pred_cls_logits_batch.dim() == 2:
@@ -251,49 +210,23 @@ def visualize_batches(
 
             pred_scores, pred_labels = pred_cls_logits_batch[local_idx].max(dim=1)
             keep = pred_scores >= score_threshold
-            if use_obb:
-                pred_boxes_xywhr = pred_boxes_batch[local_idx]
-                if pred_boxes_xywhr.shape[-1] != 5:
-                    raise ValueError(
-                        f"Expected OBB predictions with 5 channels, got shape {tuple(pred_boxes_xywhr.shape)}."
-                    )
-                pred_img = _draw_obb_boxes(
-                    base_img,
-                    pred_boxes_xywhr[keep],
-                    pred_labels[keep],
-                    classes,
-                    image_size=(w, h),
-                    scores=pred_scores[keep],
-                )
 
-                gt_boxes = target["boxes"].detach().cpu().clone()
-                if gt_boxes.numel() == 0:
-                    gt_boxes_xywhr = gt_boxes.new_zeros((0, 5))
-                elif gt_boxes.shape[-1] == 8:
-                    gt_boxes_xywhr = xyxyxyxy2xywhr(gt_boxes)
-                elif gt_boxes.shape[-1] == 5:
-                    gt_boxes_xywhr = gt_boxes
-                else:
-                    raise ValueError(f"Unsupported OBB GT shape {tuple(gt_boxes.shape)}.")
-                gt_labels = target["labels"].detach().cpu()
-                gt_img = _draw_obb_boxes(base_img, gt_boxes_xywhr, gt_labels, classes, image_size=(w, h), scores=None)
-            else:
-                pred_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes_batch[local_idx])
-                pred_boxes_xyxy[:, [0, 2]] *= float(w)
-                pred_boxes_xyxy[:, [1, 3]] *= float(h)
-                pred_img = _draw_boxes(
-                    base_img,
-                    pred_boxes_xyxy[keep],
-                    pred_labels[keep],
-                    classes,
-                    pred_scores[keep],
-                )
+            pred_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes_batch[local_idx])
+            pred_boxes_xyxy[:, [0, 2]] *= float(w)
+            pred_boxes_xyxy[:, [1, 3]] *= float(h)
+            pred_img = _draw_boxes(
+                base_img,
+                pred_boxes_xyxy[keep],
+                pred_labels[keep],
+                classes,
+                pred_scores[keep],
+            )
 
-                gt_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(target["boxes"].detach().cpu().clone())
-                gt_boxes_xyxy[:, [0, 2]] *= float(w)
-                gt_boxes_xyxy[:, [1, 3]] *= float(h)
-                gt_labels = target["labels"].detach().cpu()
-                gt_img = _draw_boxes(base_img, gt_boxes_xyxy, gt_labels, classes, None)
+            gt_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(target["boxes"].detach().cpu().clone())
+            gt_boxes_xyxy[:, [0, 2]] *= float(w)
+            gt_boxes_xyxy[:, [1, 3]] *= float(h)
+            gt_labels = target["labels"].detach().cpu()
+            gt_img = _draw_boxes(base_img, gt_boxes_xyxy, gt_labels, classes, None)
 
             paired = Image.new("RGB", (pred_img.width * 2, pred_img.height))
             paired.paste(pred_img, (0, 0))
@@ -335,18 +268,11 @@ def main() -> None:
             TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    if args.use_obb:
-        test_dataset = YoloOBBDataset(
-            args.dataset_yaml,
-            split=args.test_split,
-            transform=test_transform,
-        )
-    else:
-        test_dataset = YoloDetectionDataset(
-            args.dataset_yaml,
-            split=args.test_split,
-            transform=test_transform,
-        )
+    test_dataset = YoloDetectionDataset(
+        args.dataset_yaml,
+        split=args.test_split,
+        transform=test_transform,
+    )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -365,45 +291,35 @@ def main() -> None:
         model=base_model,
         classes=classes,
         prompt_len=args.prompt_len,
+        text_mode=args.text_mode,
         inject_before_encoder=args.inject_before_encoder,
-        use_obb=args.use_obb,
-        use_lora=args.use_lora,
+        use_lora=(args.param_tune == "lora"),
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_targets=lora_targets,
         lora_layers=lora_layers,
     ).to(device)
-    configure_model_trainable_flags(wrapper, use_lora=args.use_lora)
+    configure_model_trainable_flags(
+        wrapper,
+        text_mode=args.text_mode,
+        param_tune=args.param_tune,
+    )
     if args.weight is not None:
         weight_ckpt = torch.load(args.weight, map_location="cpu")
         load_wrapper_checkpoint(wrapper, weight_ckpt, device=device)
 
     log_file = log_dir / "test_log.jsonl"
-    if args.use_obb:
-        test_metrics = evaluate_obb(
-            wrapper,
-            test_loader,
-            classes,
-            device=device,
-            iou_threshold=args.eval_iou_threshold,
-            ap_score_threshold=args.eval_ap_score_threshold,
-            pr_score_threshold=args.eval_pr_score_threshold,
-            progress_desc="Testing",
-            zero_shot=args.zero_shot,
-        )
-    else:
-        test_metrics = evaluate_detection(
-            wrapper,
-            test_loader,
-            classes,
-            device=device,
-            iou_threshold=args.eval_iou_threshold,
-            ap_score_threshold=args.eval_ap_score_threshold,
-            pr_score_threshold=args.eval_pr_score_threshold,
-            progress_desc="Testing",
-            zero_shot=args.zero_shot,
-        )
+    test_metrics = evaluate_detection(
+        wrapper,
+        test_loader,
+        classes,
+        device=device,
+        iou_threshold=args.eval_iou_threshold,
+        ap_score_threshold=args.eval_ap_score_threshold,
+        pr_score_threshold=args.eval_pr_score_threshold,
+        progress_desc="Testing",
+    )
     vis_info = None
     if args.vis_batch > 0:
         vis_score_thr = (
@@ -420,8 +336,6 @@ def main() -> None:
             vis_batch=args.vis_batch,
             score_threshold=vis_score_thr,
             vis_dir=vis_dir,
-            zero_shot=args.zero_shot,
-            use_obb=args.use_obb,
             aggregation_method=args.aggregation_method,
         )
         vis_info = {

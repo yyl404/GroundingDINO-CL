@@ -1,8 +1,8 @@
 TOKENIZERS_PARALLELISM=false
 
 TASK_DATASETS=(
-    data/RSAR-TINY_3+3/task_1_cls_3/data.yaml
-    data/RSAR-TINY_3+3/task_2_cls_3/data.yaml
+    data/VOC_10+10/task_1_cls_10/data.yaml
+    data/VOC_10+10/task_2_cls_10/data.yaml
 )
 
 START_TASK="${START_TASK:-1}"
@@ -13,7 +13,7 @@ for idx in "${!TASK_DATASETS[@]}"; do
     continue
   fi
   dataset_yaml="${TASK_DATASETS[$idx]}"
-  output_dir="outputs/train_wrapper_rsar_3+3/task_${task_id}"
+  output_dir="outputs/train_wrapper_voc_10+10/task_${task_id}"
 
   cmd=(
     python tools/train_wrapper.py
@@ -24,13 +24,13 @@ for idx in "${!TASK_DATASETS[@]}"; do
     --batch_size 4
     --lr 1e-4
     --output_dir "$output_dir"
-    --inject_before_encoder
-    --use-obb
+    --text_mode prompt
+    --param_tune lora
   )
 
   if [ "$task_id" -gt 1 ]; then
     prev_task_id=$((task_id - 1))
-    prev_ckpt="outputs/train_wrapper_rsar_3+3/task_${prev_task_id}/checkpoints/best_map50.pt"
+    prev_ckpt="outputs/train_wrapper_voc_10+10/task_${prev_task_id}/checkpoints/best_map50.pt"
     cmd+=(--load_wrapper "$prev_ckpt")
   fi
 

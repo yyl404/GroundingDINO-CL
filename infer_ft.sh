@@ -6,5 +6,5 @@ CUDA_VISIBLE_DEVICES=0 python tools/inference_on_a_image_wrapper.py \
     -wp outputs/train_wrapper_hrsc/checkpoints/best_map50.pt \
     --aggregation_method mean \
     --box_threshold 0.25 \
-    --inject_before_encoder \
+    --text_mode prompt \
     -cls "ship"

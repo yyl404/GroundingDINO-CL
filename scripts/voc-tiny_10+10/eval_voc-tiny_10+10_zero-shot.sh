@@ -18,8 +18,8 @@ for idx in "${!TASK_DATASETS[@]}"; do
     --dataset_yaml "$dataset_yaml"
     --batch_size 4
     --output_dir "$output_dir"
-    --inject_before_encoder
-    --zero-shot
+    --text_mode fixed
+    --param_tune frozen
   )
 
   "${cmd[@]}"

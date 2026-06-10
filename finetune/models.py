@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
+from groundingdino.models.GroundingDINO.bertwarper import generate_masks_with_special_tokens_and_transfer_map
 from groundingdino.models.GroundingDINO.groundingdino import GroundingDINO
 from groundingdino.models.GroundingDINO.utils import MLP
 from groundingdino.util.vl_utils import create_positive_map_from_span
@@ -63,8 +64,8 @@ class GroundingDINOWrapper(nn.Module):
         model: GroundingDINO,
         classes: List[str],
         prompt_len=4,
+        text_mode: str = "prompt",
         inject_before_encoder=True,
-        use_obb=False,
         use_lora: bool = False,
         lora_r: int = 8,
         lora_alpha: float = 16.0,
@@ -73,9 +74,12 @@ class GroundingDINOWrapper(nn.Module):
         lora_layers: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
+        if text_mode not in ("prompt", "fixed"):
+            raise ValueError(f"text_mode must be 'prompt' or 'fixed', got {text_mode!r}.")
         self.model = model
         self.classes = classes
-        self.prompt_len=prompt_len
+        self.prompt_len = prompt_len
+        self.text_mode = text_mode
         self.inject_before_encoder = inject_before_encoder
         self.use_lora = use_lora
         self.lora_r = lora_r
@@ -83,7 +87,11 @@ class GroundingDINOWrapper(nn.Module):
         self.lora_dropout = lora_dropout
         self.lora_targets = tuple(lora_targets)
         self.lora_layers = None if lora_layers is None else tuple(sorted({int(i) for i in lora_layers}))
-        self._init_embeddings()
+
+        if self.text_mode == "prompt":
+            self._init_embeddings()
+        else:
+            self.embeddings = None
 
         hidden_dim = self.model.hidden_dim
         self.bbox_embed_last_layer = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -92,10 +100,6 @@ class GroundingDINOWrapper(nn.Module):
         num_classes = len(classes)
         self.cls_head = self._build_cls_head(num_classes)
         self._zero_init_module(self.cls_head)
-
-        self.use_obb = use_obb
-        if use_obb:
-            self.angle_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
         if self.use_lora:
             self._inject_lora_into_model()
@@ -250,6 +254,63 @@ class GroundingDINOWrapper(nn.Module):
 
         return out
 
+    def _encode_fixed_text(self, classes: List[str], batch_size: int) -> Tuple[Dict[str, Tensor], Tensor]:
+        model = self.model
+        device = next(model.parameters()).device
+
+        caption_text = ""
+        token_spans = []
+        for cls_name in classes:
+            token_spans.append([[len(caption_text), len(caption_text) + len(cls_name)]])
+            caption_text += (cls_name + ".")
+        captions = [caption_text for _ in range(batch_size)]
+
+        positive_maps = create_positive_map_from_span(
+            model.tokenizer(caption_text),
+            token_span=token_spans,
+        ).to(device)
+
+        tokenized = model.tokenizer(captions, padding="longest", return_tensors="pt").to(device)
+        text_self_attention_masks, position_ids, _ = generate_masks_with_special_tokens_and_transfer_map(
+            tokenized, model.specical_tokens, model.tokenizer
+        )
+
+        if text_self_attention_masks.shape[1] > model.max_text_len:
+            text_self_attention_masks = text_self_attention_masks[
+                :, : model.max_text_len, : model.max_text_len
+            ]
+            position_ids = position_ids[:, : model.max_text_len]
+            tokenized["input_ids"] = tokenized["input_ids"][:, : model.max_text_len]
+            tokenized["attention_mask"] = tokenized["attention_mask"][:, : model.max_text_len]
+            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : model.max_text_len]
+
+        if model.sub_sentence_present:
+            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
+            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+            tokenized_for_encoder["position_ids"] = position_ids
+        else:
+            tokenized_for_encoder = tokenized
+
+        bert_output = model.bert(**tokenized_for_encoder)
+        encoded_text = model.feat_map(bert_output["last_hidden_state"])
+        text_token_mask = tokenized["attention_mask"].bool()
+
+        if encoded_text.shape[1] > model.max_text_len:
+            encoded_text = encoded_text[:, : model.max_text_len, :]
+            text_token_mask = text_token_mask[:, : model.max_text_len]
+            position_ids = position_ids[:, : model.max_text_len]
+            text_self_attention_masks = text_self_attention_masks[
+                :, : model.max_text_len, : model.max_text_len
+            ]
+
+        text_dict = {
+            "encoded_text": encoded_text,
+            "text_token_mask": text_token_mask,
+            "position_ids": position_ids,
+            "text_self_attention_masks": text_self_attention_masks,
+        }
+        return text_dict, positive_maps
+
     def concat_embeddings(self, classes: List[str]):
         model = self.model
         tokenizer = model.tokenizer
@@ -357,43 +418,12 @@ class GroundingDINOWrapper(nn.Module):
 
             return text_dict, positive_maps
 
-    def forward_zeroshot(self, samples: Union[NestedTensor, List[Tensor]], classes:List[str]=None, **kw):
-        # If the target classes are not designated, use the built-in vocabulary
-        if classes is None:
-            classes = self.classes
-        else:
-            unknown = [_c for _c in classes if _c not in self.classes]
-            if unknown: warnings.warn(f"Ignoring classes not in self.classes: {unknown}", UserWarning, stacklevel=2)
-            classes = [_c for _c in classes if _c in self.classes]
-
-        if len(classes) == 0:
-            raise ValueError("`classes` is empty after filtering; please provide at least one valid class.")
-        
-        model = self.model
-
-        # Get batch size
-        if isinstance(samples, (list, torch.Tensor)):
-            samples = nested_tensor_from_tensor_list(samples)
-        batch_size = int(samples.tensors.shape[0])
-
-        # Construct captions and token spans from classes
-        caption_text = ""
-        token_spans = []
-        for _c in classes:
-            token_spans.append([[len(caption_text), len(caption_text)+len(_c)]])
-            caption_text += (_c + ".")
-        captions = [caption_text for _ in range(batch_size)]
-        
-        positive_maps = create_positive_map_from_span(
-            model.tokenizer(caption_text),
-            token_span=token_spans
-        ).to(samples.device) # n_phrase, 256
-
-        outputs = model(samples, captions=captions, **kw)
-
-        # aggregate token-wise logits to class-wise logits
-        logits = outputs["pred_logits"].sigmoid()  # (bs, nq, 256)s
-        aggregation_method = kw.get("aggregation_method", "max")
+    def _aggregate_class_logits(
+        self,
+        logits: Tensor,
+        positive_maps: Tensor,
+        aggregation_method: str,
+    ) -> Tensor:
         if aggregation_method == "mean":
             # positive_maps is normalized when created
             class_logits = torch.einsum("ct,bqt->bqc", positive_maps, logits)
@@ -411,13 +441,8 @@ class GroundingDINOWrapper(nn.Module):
             class_logits = class_logits.min(dim=-1).values.transpose(1, 2)
         else:
             raise ValueError(f"Aggregation method {aggregation_method} is not available. Current choice: 'mean', 'sum', 'max', 'min'")
-        
-        # class_logits = (inverse_sigmoid(class_logits) + delta_class_logits_unsig).sigmoid()
-        outputs["pred_class_logits"] = class_logits
+        return class_logits
 
-        return outputs
-
-    
     def forward(self, samples: Union[NestedTensor, List[Tensor]], classes:List[str]=None, **kw):
         # If the target classes are not designated, use the built-in vocabulary
         if classes is None:
@@ -429,8 +454,13 @@ class GroundingDINOWrapper(nn.Module):
         
         model = self.model
 
-        # concat embeddings
-        if self.inject_before_encoder:
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        batch_size = int(samples.tensors.shape[0])
+
+        if self.text_mode == "fixed":
+            text_dict, positive_maps = self._encode_fixed_text(classes, batch_size)
+        elif self.inject_before_encoder:
             tokenized, text_self_attention_masks, position_ids, positive_maps = self.concat_embeddings(classes)
 
             if model.sub_sentence_present:
@@ -467,9 +497,6 @@ class GroundingDINOWrapper(nn.Module):
             text_dict, positive_maps = self.concat_embeddings(classes)
 
         # import ipdb; ipdb.set_trace()
-        if isinstance(samples, (list, torch.Tensor)):
-            samples = nested_tensor_from_tensor_list(samples)
-        batch_size = int(samples.tensors.shape[0])
         text_dict = self._broadcast_text_dict(text_dict, batch_size)
         if not hasattr(self, 'features') or not hasattr(self, 'poss'):
             model.set_image_tensor(samples)
@@ -513,13 +540,7 @@ class GroundingDINOWrapper(nn.Module):
             outputs_coord_list.append(layer_outputs_unsig)
         outputs_coord_list = torch.stack(outputs_coord_list)
 
-        # predict angle for obb
-        if self.use_obb:
-            angle = self.angle_head(hs[-1]) # bs, 1
-            angle = (torch.sigmoid(angle) - 0.25) * math.pi # [-1/4 pi, 3/4 pi]
-            pred_boxes = torch.concat([outputs_coord_list[-1], angle], dim=2)
-        else:
-            pred_boxes = outputs_coord_list[-1]
+        pred_boxes = outputs_coord_list[-1]
 
         # output
         outputs_class = torch.stack(
@@ -553,23 +574,7 @@ class GroundingDINOWrapper(nn.Module):
         # aggregate token-wise logits to class-wise logits
         aggregation_method = kw.get("aggregation_method", "max")
         logits = outputs_class[-1].sigmoid()  # bs, nq, ntoken
-        if aggregation_method == "mean":
-            # positive_maps is normalized when created
-            class_logits = torch.einsum("ct,bqt->bqc", positive_maps, logits)
-        elif aggregation_method == "sum":
-            positive_maps_unnormalized = (positive_maps > 1e-6).to(dtype=logits.dtype)
-            class_logits = torch.einsum("ct,bqt->bqc", positive_maps_unnormalized, logits)
-            class_logits = torch.clamp(class_logits, 0.0, 1.0)
-        elif aggregation_method == "max":
-            token_mask = positive_maps > 1e-6
-            class_logits = logits[:, None, :, :].masked_fill(~token_mask[None, :, None, :], float("-inf"))
-            class_logits = class_logits.max(dim=-1).values.transpose(1, 2)
-        elif aggregation_method == "min":
-            token_mask = positive_maps > 1e-6
-            class_logits = logits[:, None, :, :].masked_fill(~token_mask[None, :, None, :], float("inf"))
-            class_logits = class_logits.min(dim=-1).values.transpose(1, 2)
-        else:
-            raise ValueError(f"Aggregation method {aggregation_method} is not available. Current choice: 'mean', 'sum', 'max', 'min'")
+        class_logits = self._aggregate_class_logits(logits, positive_maps, aggregation_method)
         
         class_logits = (inverse_sigmoid(class_logits) + delta_class_logits_unsig).sigmoid()
         out["pred_class_logits"] = class_logits
@@ -586,6 +591,11 @@ class GroundingDINOWrapper(nn.Module):
             if unknown: warnings.warn(f"Ignoring classes not in self.classes: {unknown}", UserWarning, stacklevel=2)
             classes = [_c for _c in classes if _c in self.classes]
         
+        if self.text_mode != "prompt":
+            raise NotImplementedError(
+                "decode_embeddings is only supported when text_mode='prompt'."
+            )
+
         if self.inject_before_encoder:
             if len(classes) == 0:
                 return {}

@@ -27,7 +27,6 @@ from utils import (
     load_model,
     load_wrapper_checkpoint,
     parse_lora_layers,
-    xywhr_to_corners_xyxyxyxy,
 )
 
 
@@ -41,49 +40,30 @@ def plot_boxes_to_image(image_pil, tgt):
     mask = Image.new("L", image_pil.size, 0)
     mask_draw = ImageDraw.Draw(mask)
 
-    # draw boxes and masks
-    if boxes.numel() > 0 and boxes.shape[-1] == 5:
-        corners = xywhr_to_corners_xyxyxyxy(boxes, float(W), float(H))
-        for corner, label in zip(corners, labels):
-            color = tuple(np.random.randint(0, 255, size=3).tolist())
-            pts = corner.reshape(4, 2).tolist()
-            draw.polygon([tuple(p) for p in pts], outline=color, width=6)
+    for box, label in zip(boxes, labels):
+        # from 0..1 to 0..W, 0..H
+        box = box * torch.Tensor([W, H, W, H])
+        # from xywh to xyxy
+        box[:2] -= box[2:] / 2
+        box[2:] += box[:2]
+        # random color
+        color = tuple(np.random.randint(0, 255, size=3).tolist())
+        # draw
+        x0, y0, x1, y1 = box
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
 
-            x0, y0 = pts[0]
-            font = ImageFont.load_default()
-            if hasattr(font, "getbbox"):
-                bbox = draw.textbbox((x0, y0), str(label), font)
-            else:
-                w, h = draw.textsize(str(label), font)
-                bbox = (x0, y0, w + x0, y0 + h)
-            draw.rectangle(bbox, fill=color)
-            draw.text((x0, y0), str(label), fill="white")
-            mask_draw.polygon([tuple(p) for p in pts], fill=255)
-    else:
-        for box, label in zip(boxes, labels):
-            # from 0..1 to 0..W, 0..H
-            box = box * torch.Tensor([W, H, W, H])
-            # from xywh to xyxy
-            box[:2] -= box[2:] / 2
-            box[2:] += box[:2]
-            # random color
-            color = tuple(np.random.randint(0, 255, size=3).tolist())
-            # draw
-            x0, y0, x1, y1 = box
-            x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
 
-            draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
+        font = ImageFont.load_default()
+        if hasattr(font, "getbbox"):
+            bbox = draw.textbbox((x0, y0), str(label), font)
+        else:
+            w, h = draw.textsize(str(label), font)
+            bbox = (x0, y0, w + x0, y0 + h)
+        draw.rectangle(bbox, fill=color)
+        draw.text((x0, y0), str(label), fill="white")
 
-            font = ImageFont.load_default()
-            if hasattr(font, "getbbox"):
-                bbox = draw.textbbox((x0, y0), str(label), font)
-            else:
-                w, h = draw.textsize(str(label), font)
-                bbox = (x0, y0, w + x0, y0 + h)
-            draw.rectangle(bbox, fill=color)
-            draw.text((x0, y0), str(label), fill="white")
-
-            mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
+        mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
 
     return image_pil, mask
 
@@ -112,7 +92,7 @@ def get_grounding_output(model, image, classes, box_threshold, aggregation_metho
         classes = model.classes
     with torch.no_grad():
         outputs = model(image[None], classes, aggregation_method=aggregation_method)
-    boxes = outputs["pred_boxes"][0]  # (nq, 4) or (nq, 5) for OBB
+    boxes = outputs["pred_boxes"][0]  # (nq, 4)
     class_logits = outputs["pred_class_logits"][0] # (nq, n_classes)
 
     # filter output
@@ -155,12 +135,25 @@ if __name__ == "__main__":
 
     parser.add_argument("--box_threshold", type=float, default=0.3, help="box threshold")
     parser.add_argument("--aggregation_method", type=str, choices=['mean', 'sum', 'max', 'min'], default='mean')
+    parser.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["prompt", "fixed"],
+        default="prompt",
+        help="Text input mode: 'prompt' for learnable prompt embeddings, 'fixed' for class-name captions.",
+    )
+    parser.add_argument(
+        "--param_tune",
+        type=str,
+        choices=["full", "lora", "delta", "frozen"],
+        default="delta",
+        help="Parameter tuning mode: full non-text, LoRA, output delta heads, or fully frozen.",
+    )
     parser.add_argument("--prompt_len", type=int, default=4, help="prompt token length per class")
     parser.add_argument("--inject_before_encoder",
         action="store_true",
         help="whether to inject learnable class embeddings before text encoder",
     )
-    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
@@ -177,7 +170,6 @@ if __name__ == "__main__":
         help="Transformer layer indices for LoRA, e.g. '0,1,2'; use 'all' for all layers.",
     )
     parser.add_argument("--cpu-only", action="store_true", help="running on cpu only!, default=False")
-    parser.add_argument("--use_obb", action="store_true", help="Enable OBB output (xywhr) from wrapper.")
     args = parser.parse_args()
 
     # cfg
@@ -210,15 +202,19 @@ if __name__ == "__main__":
     model = GroundingDINOWrapper(classes=classes,
                                  model=model,
                                  prompt_len=prompt_len,
+                                 text_mode=args.text_mode,
                                  inject_before_encoder=inject_before_encoder,
-                                 use_obb=args.use_obb,
-                                 use_lora=args.use_lora,
+                                 use_lora=(args.param_tune == "lora"),
                                  lora_r=args.lora_r,
                                  lora_alpha=args.lora_alpha,
                                  lora_dropout=args.lora_dropout,
                                  lora_targets=lora_targets,
                                  lora_layers=lora_layers)
-    configure_model_trainable_flags(model, use_lora=args.use_lora)
+    configure_model_trainable_flags(
+        model,
+        text_mode=args.text_mode,
+        param_tune=args.param_tune,
+    )
     if wrapper_checkpoint is not None:
         load_wrapper_checkpoint(
             model,

@@ -3,7 +3,6 @@ from typing import Union, Callable, Dict, List
 from pathlib import Path
 import warnings
 import numpy as np
-import cv2
 
 from PIL import Image
 import torch
@@ -212,66 +211,6 @@ class YoloDetectionDataset(YoloBaseDataset):
             return {
                 "labels": torch.zeros(0, dtype=torch.long),
                 "boxes": torch.zeros((0, 4), dtype=torch.float32),
-            }
-
-        return {
-            "labels": torch.tensor(labels, dtype=torch.long),
-            "boxes": torch.tensor(boxes, dtype=torch.float32),
-        }
-
-
-def xyxyxyxy2xywhr(x):
-    """Convert batched Oriented Bounding Boxes (OBB) from [xy1, xy2, xy3, xy4] to [xywh, rotation] format.
-
-    Args:
-        x (np.ndarray | torch.Tensor): Input box corners with shape (N, 8) in [xy1, xy2, xy3, xy4] format.
-
-    Returns:
-        (np.ndarray | torch.Tensor): Converted data in [cx, cy, w, h, rotation] format with shape (N, 5). Rotation
-            values are in radians from 0 to pi/2.
-    """
-    is_torch = isinstance(x, torch.Tensor)
-    points = x.cpu().numpy() if is_torch else x
-    points = points.reshape(len(x), -1, 2)
-    rboxes = []
-    for pts in points:
-        # NOTE: Use cv2.minAreaRect to get accurate xywhr,
-        # especially some objects are cut off by augmentations in dataloader.
-        (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
-        rboxes.append([cx, cy, w, h, angle / 180 * np.pi])
-    return torch.tensor(rboxes, device=x.device, dtype=x.dtype) if is_torch else np.asarray(rboxes)
-
-
-class YoloOBBDataset(YoloDetectionDataset):
-    def _read_labels(self, label_path: Union[str, Path]) -> Dict[str, Tensor]:
-        """Read one YOLO-OBB txt file into tensor dict: labels[N], boxes[N,8] as (x1,y1,...,x4,y4)."""
-        label_path = Path(label_path).expanduser().resolve()
-        if not label_path.is_file():
-            warnings.warn(f"Label file not found: {label_path}")
-            return {
-                "labels": torch.zeros(0, dtype=torch.long),
-                "boxes": torch.zeros((0, 8), dtype=torch.float32),
-            }
-
-        labels = []
-        boxes = []
-        with label_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) < 9:
-                    continue
-                cls_id = int(float(parts[0]))
-                x1, y1, x2, y2, x3, y3, x4, y4 = map(float, parts[1:9])
-                labels.append(cls_id)
-                boxes.append([x1, y1, x2, y2, x3, y3, x4, y4])
-
-        if not labels:
-            return {
-                "labels": torch.zeros(0, dtype=torch.long),
-                "boxes": torch.zeros((0, 8), dtype=torch.float32),
             }
 
         return {

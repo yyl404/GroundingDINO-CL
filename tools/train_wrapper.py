@@ -25,9 +25,9 @@ from tqdm import tqdm
 from groundingdino.util.misc import NestedTensor
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import YoloOBBDataset, YoloDetectionDataset, collate_fn, xyxyxyxy2xywhr
-from finetune.eval import evaluate_detection, evaluate_obb
-from finetune.losses import wrapper_loss, wrapper_loss_obb
+from finetune.datasets.yolo import YoloDetectionDataset, collate_fn
+from finetune.eval import evaluate_detection
+from finetune.losses import wrapper_loss
 from utils import (
     configure_model_trainable_flags,
     load_model,
@@ -45,7 +45,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained_checkpoint", type=str, required=True, help="GroundingDINO checkpoint path")
     parser.add_argument("--dataset_yaml", type=str, required=True, help="YOLO dataset yaml path")
     parser.add_argument("--classes", type=str, default=None, help='Comma-separated classes. If omitted, use dataset yaml "names".')
-    parser.add_argument("--use-obb", action="store_true")
 
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="val")
@@ -59,10 +58,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
+    parser.add_argument(
+        "--text_mode",
+        type=str,
+        choices=["prompt", "fixed"],
+        default="prompt",
+        help="Text input mode: 'prompt' for learnable prompt embeddings, 'fixed' for class-name captions.",
+    )
+    parser.add_argument(
+        "--param_tune",
+        type=str,
+        choices=["full", "lora", "delta", "frozen"],
+        default="delta",
+        help="Parameter tuning mode: full non-text, LoRA, output delta heads, or fully frozen.",
+    )
     parser.add_argument("--prompt_len", type=int, default=4)
     parser.add_argument("--inject_before_encoder", action="store_true")
     parser.add_argument("--aggregation_method", type=str, choices=["mean", "sum", "max", "min"], default="max")
-    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA on selected Linear layers in base model.")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling.")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
@@ -109,9 +121,9 @@ def save_checkpoint(
         "classes": list(wrapper.classes),
         "wrapper_kwargs": {
             "prompt_len": args.prompt_len if args else None,
+            "text_mode": args.text_mode if args else None,
             "inject_before_encoder": args.inject_before_encoder if args else None,
-            "use_obb": args.use_obb if args else None,
-            "use_lora": args.use_lora if args else None,
+            "param_tune": args.param_tune if args else None,
             "lora_r": args.lora_r if args else None,
             "lora_alpha": args.lora_alpha if args else None,
             "lora_dropout": args.lora_dropout if args else None,
@@ -141,13 +153,6 @@ def train_one_epoch(
     for step, (images, targets) in enumerate(pbar, start=1):
         images = images.to(device)
         targets = move_targets_to_device(targets, device=device)
-        if args.use_obb:
-            converted_targets = []
-            for target in targets:
-                boxes = target.pop("boxes")
-                boxes_xywhr = xyxyxyxy2xywhr(boxes)
-                converted_targets.append({**target, "boxes": boxes_xywhr})
-            targets = converted_targets
 
         outputs = wrapper(
             images,
@@ -155,10 +160,7 @@ def train_one_epoch(
             aggregation_method=args.aggregation_method,
         )
 
-        if args.use_obb:
-            loss_dict = wrapper_loss_obb(outputs, targets)
-        else:
-            loss_dict = wrapper_loss(outputs, targets)
+        loss_dict = wrapper_loss(outputs, targets)
         
         optimizer.zero_grad()
         loss_dict["loss_total"].backward()
@@ -224,28 +226,16 @@ def main() -> None:
             TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    if args.use_obb:
-        train_dataset = YoloOBBDataset(
-            args.dataset_yaml,
-            split=args.train_split,
-            transform=train_transform,
-        )
-        val_dataset = YoloOBBDataset(
-            args.dataset_yaml,
-            split=args.val_split,
-            transform=val_transform,
-        )
-    else:
-        train_dataset = YoloDetectionDataset(
-            args.dataset_yaml,
-            split=args.train_split,
-            transform=train_transform,
-        )
-        val_dataset = YoloDetectionDataset(
-            args.dataset_yaml,
-            split=args.val_split,
-            transform=val_transform,
-        )
+    train_dataset = YoloDetectionDataset(
+        args.dataset_yaml,
+        split=args.train_split,
+        transform=train_transform,
+    )
+    val_dataset = YoloDetectionDataset(
+        args.dataset_yaml,
+        split=args.val_split,
+        transform=val_transform,
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -273,16 +263,20 @@ def main() -> None:
         model=base_model,
         classes=classes,
         prompt_len=args.prompt_len,
+        text_mode=args.text_mode,
         inject_before_encoder=args.inject_before_encoder,
-        use_obb=args.use_obb,
-        use_lora=args.use_lora,
+        use_lora=(args.param_tune == "lora"),
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_targets=lora_targets,
         lora_layers=lora_layers,
     ).to(device)
-    configure_model_trainable_flags(wrapper, use_lora=args.use_lora)
+    configure_model_trainable_flags(
+        wrapper,
+        text_mode=args.text_mode,
+        param_tune=args.param_tune,
+    )
     checkpoint = None
     if args.load_wrapper:
         checkpoint = torch.load(args.load_wrapper, map_location="cpu")
@@ -332,28 +326,16 @@ def main() -> None:
             wrapper=wrapper
         )
 
-        if args.use_obb:
-            val_metrics = evaluate_obb(
-                wrapper,
-                val_loader,
-                classes,
-                device=device,
-                iou_threshold=args.eval_iou_threshold,
-                ap_score_threshold=args.eval_ap_score_threshold,
-                pr_score_threshold=args.eval_pr_score_threshold,
-                progress_desc=f"Eval Epoch {epoch}",
-            )
-        else:
-            val_metrics = evaluate_detection(
-                wrapper,
-                val_loader,
-                classes,
-                device=device,
-                iou_threshold=args.eval_iou_threshold,
-                ap_score_threshold=args.eval_ap_score_threshold,
-                pr_score_threshold=args.eval_pr_score_threshold,
-                progress_desc=f"Eval Epoch {epoch}",
-            )
+        val_metrics = evaluate_detection(
+            wrapper,
+            val_loader,
+            classes,
+            device=device,
+            iou_threshold=args.eval_iou_threshold,
+            ap_score_threshold=args.eval_ap_score_threshold,
+            pr_score_threshold=args.eval_pr_score_threshold,
+            progress_desc=f"Eval Epoch {epoch}",
+        )
         val_log = {"epoch": epoch, "phase": "val", **val_metrics}
         with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(val_log, ensure_ascii=False) + "\n")

@@ -51,38 +51,55 @@ def parse_lora_layers(raw: str) -> list[int] | None:
     return layers
 
 
-def configure_model_trainable_flags(wrapper: GroundingDINOWrapper, use_lora: bool) -> None:
-    for name, p in wrapper.model.named_parameters():
-        p.requires_grad = bool(use_lora and ("lora_A" in name or "lora_B" in name))
+_TEXT_BRANCH_PARAM_MARKERS = (
+    "bert.",
+    "feat_map.",
+    ".text_layers.",
+    ".fusion_layers.",
+    ".ca_text.",
+    ".catext_",
+)
 
 
-def xywhr_to_corners_xyxyxyxy(boxes_xywhr: torch.Tensor, width: float, height: float) -> torch.Tensor:
-    """Convert normalized xywhr boxes to pixel-space corners [N, 8]."""
-    if boxes_xywhr.numel() == 0:
-        return boxes_xywhr.new_zeros((0, 8))
-    cx = boxes_xywhr[:, 0] * width
-    cy = boxes_xywhr[:, 1] * height
-    bw = boxes_xywhr[:, 2] * width
-    bh = boxes_xywhr[:, 3] * height
-    theta = boxes_xywhr[:, 4]
+def is_text_branch_parameter(name: str) -> bool:
+    return any(marker in name for marker in _TEXT_BRANCH_PARAM_MARKERS)
 
-    dx = bw * 0.5
-    dy = bh * 0.5
-    local = torch.tensor(
-        [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]],
-        dtype=boxes_xywhr.dtype,
-        device=boxes_xywhr.device,
-    ).unsqueeze(0)
-    local[..., 0] *= dx.unsqueeze(1)
-    local[..., 1] *= dy.unsqueeze(1)
 
-    cos_t = torch.cos(theta).unsqueeze(1)
-    sin_t = torch.sin(theta).unsqueeze(1)
-    rot_x = local[..., 0] * cos_t - local[..., 1] * sin_t
-    rot_y = local[..., 0] * sin_t + local[..., 1] * cos_t
-    x = rot_x + cx.unsqueeze(1)
-    y = rot_y + cy.unsqueeze(1)
-    return torch.stack((x, y), dim=-1).reshape(-1, 8)
+TEXT_MODES = ("prompt", "fixed")
+PARAM_TUNES = ("full", "lora", "delta", "frozen")
+
+
+def configure_model_trainable_flags(
+    wrapper: GroundingDINOWrapper,
+    *,
+    text_mode: str,
+    param_tune: str,
+) -> None:
+    if text_mode not in TEXT_MODES:
+        raise ValueError(f"text_mode must be one of {TEXT_MODES}, got {text_mode!r}.")
+    if param_tune not in PARAM_TUNES:
+        raise ValueError(f"param_tune must be one of {PARAM_TUNES}, got {param_tune!r}.")
+
+    for p in wrapper.parameters():
+        p.requires_grad = False
+
+    if text_mode == "prompt":
+        wrapper.embeddings.requires_grad = True
+
+    if param_tune == "full":
+        for name, p in wrapper.model.named_parameters():
+            if not is_text_branch_parameter(name):
+                p.requires_grad = True
+    elif param_tune == "lora":
+        for name, p in wrapper.model.named_parameters():
+            p.requires_grad = "lora_A" in name or "lora_B" in name
+    elif param_tune == "delta":
+        for p in wrapper.bbox_embed_last_layer.parameters():
+            p.requires_grad = True
+        for p in wrapper.cls_head.parameters():
+            p.requires_grad = True
+    elif param_tune == "frozen":
+        pass
 
 
 def load_model(model_config_path, model_checkpoint_path, device="cuda"):
@@ -100,6 +117,7 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
     ckpt_kwargs = checkpoint["wrapper_kwargs"]
     ckpt_prompt_len = ckpt_kwargs["prompt_len"]
     ckpt_inject_before_encoder = ckpt_kwargs["inject_before_encoder"]
+    ckpt_text_mode = ckpt_kwargs.get("text_mode", "prompt")
 
     if int(ckpt_prompt_len) != int(wrapper.prompt_len):
         raise ValueError(
@@ -109,6 +127,10 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
         raise ValueError(
             "inject_before_encoder mismatch: "
             f"checkpoint={ckpt_inject_before_encoder}, wrapper={wrapper.inject_before_encoder}"
+        )
+    if ckpt_text_mode != wrapper.text_mode:
+        raise ValueError(
+            f"text_mode mismatch: checkpoint={ckpt_text_mode}, wrapper={wrapper.text_mode}"
         )
 
     ckpt_classes = list(checkpoint["classes"])
@@ -121,12 +143,7 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
         return wrapper
 
     ckpt_state_dict = checkpoint["wrapper_state_dict"]
-    ckpt_embeddings = ckpt_state_dict["embeddings"]
     ckpt_cls_head_last_layer_weight = ckpt_state_dict["cls_head.0.weight"]
-
-    emb_dtype = wrapper.embeddings.dtype
-    wrapper_embeddings = wrapper.embeddings.detach().to(device=device, dtype=emb_dtype).clone()
-    ckpt_embeddings = ckpt_embeddings.to(device=device, dtype=emb_dtype)
 
     cls_head_dtype = wrapper.cls_head[-1].weight.dtype
     cls_head_device = wrapper.cls_head[-1].weight.device
@@ -137,26 +154,68 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
 
     wrapper_class_to_idx = {name: idx for idx, name in enumerate(wrapper.classes)}
     updated_classes = list(wrapper.classes)
-    emb_rows_to_append = []
     cls_rows_to_append = []
     mapping_logs: List[str] = []
 
-    for ckpt_idx, cls_name in enumerate(ckpt_classes):
-        if cls_name in wrapper_class_to_idx:
-            dst_idx = wrapper_class_to_idx[cls_name]
-            wrapper_embeddings[dst_idx] = ckpt_embeddings[ckpt_idx]
-            wrapper_cls_head_last_layer_weight[dst_idx] = ckpt_cls_head_last_layer_weight[ckpt_idx]
-            mapping_logs.append(
-                f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (replace)"
+    if wrapper.text_mode == "prompt":
+        ckpt_embeddings = ckpt_state_dict["embeddings"]
+        emb_dtype = wrapper.embeddings.dtype
+        wrapper_embeddings = wrapper.embeddings.detach().to(device=device, dtype=emb_dtype).clone()
+        ckpt_embeddings = ckpt_embeddings.to(device=device, dtype=emb_dtype)
+        emb_rows_to_append = []
+
+        for ckpt_idx, cls_name in enumerate(ckpt_classes):
+            if cls_name in wrapper_class_to_idx:
+                dst_idx = wrapper_class_to_idx[cls_name]
+                wrapper_embeddings[dst_idx] = ckpt_embeddings[ckpt_idx]
+                wrapper_cls_head_last_layer_weight[dst_idx] = ckpt_cls_head_last_layer_weight[ckpt_idx]
+                mapping_logs.append(
+                    f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (replace)"
+                )
+            else:
+                dst_idx = len(updated_classes)
+                updated_classes.append(cls_name)
+                emb_rows_to_append.append(ckpt_embeddings[ckpt_idx : ckpt_idx + 1])
+                cls_rows_to_append.append(ckpt_cls_head_last_layer_weight[ckpt_idx : ckpt_idx + 1])
+                mapping_logs.append(
+                    f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (append)"
+                )
+
+        if emb_rows_to_append:
+            wrapper_embeddings = torch.cat([wrapper_embeddings] + emb_rows_to_append, dim=0)
+            wrapper_cls_head_last_layer_weight = torch.cat(
+                [wrapper_cls_head_last_layer_weight] + cls_rows_to_append, dim=0
             )
-        else:
-            dst_idx = len(updated_classes)
-            updated_classes.append(cls_name)
-            emb_rows_to_append.append(ckpt_embeddings[ckpt_idx : ckpt_idx + 1])
-            cls_rows_to_append.append(ckpt_cls_head_last_layer_weight[ckpt_idx : ckpt_idx + 1])
-            mapping_logs.append(
-                f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (append)"
+
+        wrapper.classes = updated_classes
+        wrapper.embeddings = nn.Parameter(wrapper_embeddings)
+    else:
+        for ckpt_idx, cls_name in enumerate(ckpt_classes):
+            if cls_name in wrapper_class_to_idx:
+                dst_idx = wrapper_class_to_idx[cls_name]
+                wrapper_cls_head_last_layer_weight[dst_idx] = ckpt_cls_head_last_layer_weight[ckpt_idx]
+                mapping_logs.append(
+                    f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (replace)"
+                )
+            else:
+                dst_idx = len(updated_classes)
+                updated_classes.append(cls_name)
+                cls_rows_to_append.append(ckpt_cls_head_last_layer_weight[ckpt_idx : ckpt_idx + 1])
+                mapping_logs.append(
+                    f"  - ckpt[{ckpt_idx}] '{cls_name}' -> wrapper[{dst_idx}] (append)"
+                )
+
+        if cls_rows_to_append:
+            wrapper_cls_head_last_layer_weight = torch.cat(
+                [wrapper_cls_head_last_layer_weight] + cls_rows_to_append, dim=0
             )
+
+        wrapper.classes = updated_classes
+
+    wrapper.cls_head = wrapper._build_cls_head(
+        len(updated_classes), device=cls_head_device, dtype=cls_head_dtype
+    )
+    wrapper.cls_head[-1].weight.data = wrapper_cls_head_last_layer_weight.detach().to(device=cls_head_device, dtype=cls_head_dtype)
 
     wrapper_only_classes = [name for name in wrapper.classes if name not in ckpt_classes]
     if mapping_logs:
@@ -167,17 +226,6 @@ def load_wrapper_checkpoint(wrapper: GroundingDINOWrapper, checkpoint: Dict, dev
             "[load_wrapper_checkpoint] wrapper-only classes unchanged: "
             + ", ".join(wrapper_only_classes)
         )
-
-    if emb_rows_to_append:
-        wrapper_embeddings = torch.cat([wrapper_embeddings] + emb_rows_to_append, dim=0)
-        wrapper_cls_head_last_layer_weight = torch.cat([wrapper_cls_head_last_layer_weight] + cls_rows_to_append, dim=0)
-
-    wrapper.classes = updated_classes
-    wrapper.embeddings = nn.Parameter(wrapper_embeddings)
-    wrapper.cls_head = wrapper._build_cls_head(
-        len(updated_classes), device=cls_head_device, dtype=cls_head_dtype
-    )
-    wrapper.cls_head[-1].weight.data = wrapper_cls_head_last_layer_weight.detach().to(device=cls_head_device, dtype=cls_head_dtype)
 
     # Load wrapper parameters except embeddings/cls_head when keys and shapes match.
     current_state = wrapper.state_dict()

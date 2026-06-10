@@ -21,7 +21,8 @@ for idx in "${!TASK_DATASETS[@]}"; do
     --batch_size 4
     --output_dir "$output_dir"
     --weight "$WEIGHT"
-    --inject_before_encoder
+    --text_mode prompt
+    --param_tune lora
   )
 
   "${cmd[@]}"
