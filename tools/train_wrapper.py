@@ -25,10 +25,11 @@ from tqdm import tqdm
 from groundingdino.util.misc import NestedTensor
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import YoloDetectionDataset, collate_fn
+from finetune.datasets.yolo import collate_fn
 from finetune.eval import evaluate_detection
 from finetune.losses import wrapper_loss
 from utils import (
+    build_detection_dataset,
     configure_model_trainable_flags,
     load_model,
     load_wrapper_checkpoint,
@@ -40,10 +41,47 @@ from utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Train GroundingDINOWrapper on YOLO dataset")
+    parser = argparse.ArgumentParser("Train GroundingDINOWrapper on YOLO or COCO dataset")
     parser.add_argument("--config_file", type=str, required=True, help="GroundingDINO config path")
     parser.add_argument("--pretrained_checkpoint", type=str, required=True, help="GroundingDINO checkpoint path")
-    parser.add_argument("--dataset_yaml", type=str, required=True, help="YOLO dataset yaml path")
+    parser.add_argument(
+        "--dataset_format",
+        type=str,
+        choices=["yolo", "coco"],
+        default="yolo",
+        help="Dataset format: 'yolo' for yaml+txt labels, 'coco' for COCO json annotations.",
+    )
+    parser.add_argument("--dataset_yaml", type=str, default=None, help="YOLO dataset yaml path (required when --dataset_format=yolo).")
+    parser.add_argument(
+        "--train_json",
+        type=str,
+        default=None,
+        help="COCO train annotation json (required when --dataset_format=coco).",
+    )
+    parser.add_argument(
+        "--val_json",
+        type=str,
+        default=None,
+        help="COCO val annotation json (required when --dataset_format=coco).",
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Image directory for COCO dataset. Defaults to the parent directory of each annotation json.",
+    )
+    parser.add_argument(
+        "--train_image_dir",
+        type=str,
+        default=None,
+        help="Train image directory for COCO. Overrides --image_dir for train split.",
+    )
+    parser.add_argument(
+        "--val_image_dir",
+        type=str,
+        default=None,
+        help="Val image directory for COCO. Overrides --image_dir for val split.",
+    )
     parser.add_argument("--classes", type=str, default=None, help='Comma-separated classes. If omitted, use dataset yaml "names".')
 
     parser.add_argument("--train_split", type=str, default="train")
@@ -98,7 +136,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--load_wrapper", type=str, default=None, help="Path to wrapper checkpoint")
     parser.add_argument("--resume", action="store_true", help="If set, also restore optimizer/epoch state from --load_wrapper.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--save_epoch_interval",
+        type=str,
+        default="save_last",
+        help=(
+            "Epoch checkpoint save policy. "
+            "'save_last' (default) only keeps checkpoints/last.pt (overwritten each epoch). "
+            "A positive integer N additionally saves checkpoints/epoch_XXX.pt every N epochs "
+            "and on the final epoch. best_map50.pt is always saved when validation mAP50 improves."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.save_epoch_interval != "save_last":
+        interval = int(args.save_epoch_interval)
+        if interval <= 0:
+            raise ValueError(
+                f"--save_epoch_interval must be 'save_last' or a positive integer, got {args.save_epoch_interval!r}"
+            )
+        args.save_epoch_interval = interval
+
+    if args.dataset_format == "yolo":
+        if args.dataset_yaml is None:
+            raise ValueError("--dataset_yaml is required when --dataset_format=yolo.")
+    elif args.dataset_format == "coco":
+        if args.train_json is None or args.val_json is None:
+            raise ValueError("--train_json and --val_json are required when --dataset_format=coco.")
+
+    return args
 
 def move_targets_to_device(targets: Sequence[Dict[str, Tensor]], device: torch.device) -> List[Dict[str, Tensor]]:
     out: List[Dict[str, Tensor]] = []
@@ -133,9 +199,15 @@ def save_checkpoint(
         "wrapper_state_dict": {k: v.detach().cpu() for k, v in wrapper.state_dict().items()},
         "optimizer": optimizer.state_dict() if optimizer else None,
         "metrics": metrics if metrics else None,
-        "best_map50": best_map50 if best_map50 else None
+        "best_map50": best_map50 if best_map50 is not None else None,
     }
     torch.save(ckpt, path)
+
+
+def should_save_interval_epoch(epoch: int, total_epochs: int, save_epoch_interval) -> bool:
+    if save_epoch_interval == "save_last":
+        return False
+    return epoch % save_epoch_interval == 0 or epoch == total_epochs
 
 
 def train_one_epoch(
@@ -196,7 +268,12 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    classes = parse_classes(args.classes, args.dataset_yaml)
+    classes_source = (
+        args.dataset_yaml
+        if args.dataset_format == "yolo"
+        else args.train_json
+    )
+    classes = parse_classes(args.classes, classes_source, dataset_format=args.dataset_format)
     lora_targets = parse_lora_targets(args.lora_targets)
     lora_layers = parse_lora_layers(args.lora_layers)
     (log_dir / "train_args.json").write_text(
@@ -226,16 +303,32 @@ def main() -> None:
             TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    train_dataset = YoloDetectionDataset(
-        args.dataset_yaml,
-        split=args.train_split,
-        transform=train_transform,
-    )
-    val_dataset = YoloDetectionDataset(
-        args.dataset_yaml,
-        split=args.val_split,
-        transform=val_transform,
-    )
+    if args.dataset_format == "yolo":
+        train_dataset = build_detection_dataset(
+            "yolo",
+            args.dataset_yaml,
+            split=args.train_split,
+            transform=train_transform,
+        )
+        val_dataset = build_detection_dataset(
+            "yolo",
+            args.dataset_yaml,
+            split=args.val_split,
+            transform=val_transform,
+        )
+    else:
+        train_dataset = build_detection_dataset(
+            "coco",
+            args.train_json,
+            image_dir=args.train_image_dir or args.image_dir,
+            transform=train_transform,
+        )
+        val_dataset = build_detection_dataset(
+            "coco",
+            args.val_json,
+            image_dir=args.val_image_dir or args.image_dir,
+            transform=val_transform,
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -320,11 +413,6 @@ def main() -> None:
         train_log = {"epoch": epoch, "phase": "train", **train_losses}
         with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(train_log, ensure_ascii=False) + "\n")
-        epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pt"
-        save_checkpoint(
-            path=epoch_ckpt,
-            wrapper=wrapper
-        )
 
         val_metrics = evaluate_detection(
             wrapper,
@@ -339,9 +427,8 @@ def main() -> None:
         val_log = {"epoch": epoch, "phase": "val", **val_metrics}
         with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(val_log, ensure_ascii=False) + "\n")
-        
-        save_checkpoint(
-            path=epoch_ckpt,
+
+        ckpt_kwargs = dict(
             wrapper=wrapper,
             optimizer=optimizer,
             epoch=epoch,
@@ -349,6 +436,10 @@ def main() -> None:
             best_map50=best_map50,
             args=args,
         )
+        save_checkpoint(path=ckpt_dir / "last.pt", **ckpt_kwargs)
+
+        if should_save_interval_epoch(epoch, args.epochs, args.save_epoch_interval):
+            save_checkpoint(path=ckpt_dir / f"epoch_{epoch:03d}.pt", **ckpt_kwargs)
 
         if val_metrics["mAP50"] > best_map50:
             best_map50 = val_metrics["mAP50"]

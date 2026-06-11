@@ -25,9 +25,10 @@ import groundingdino.datasets.transforms as T
 from groundingdino.util import box_ops
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import YoloDetectionDataset, collate_fn
-from finetune.eval import evaluate_detection
+from finetune.datasets.yolo import collate_fn
+from finetune.eval import EVAL_METRIC_CHOICES, evaluate_detection
 from utils import (
+    build_detection_dataset,
     configure_model_trainable_flags,
     load_model,
     load_wrapper_checkpoint,
@@ -39,7 +40,7 @@ from utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Test GroundingDINOWrapper on YOLO dataset")
+    parser = argparse.ArgumentParser("Test GroundingDINOWrapper on YOLO or COCO dataset")
     parser.add_argument("--config_file", type=str, required=True, help="Path to GroundingDINO config file.")
     parser.add_argument(
         "--pretrained_checkpoint",
@@ -47,7 +48,26 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to pretrained GroundingDINO checkpoint.",
     )
-    parser.add_argument("--dataset_yaml", type=str, required=True, help="Path to YOLO dataset yaml.")
+    parser.add_argument(
+        "--dataset_format",
+        type=str,
+        choices=["yolo", "coco"],
+        default="yolo",
+        help="Dataset format: 'yolo' for yaml+txt labels, 'coco' for COCO json annotations.",
+    )
+    parser.add_argument("--dataset_yaml", type=str, default=None, help="Path to YOLO dataset yaml (required when --dataset_format=yolo).")
+    parser.add_argument(
+        "--test_json",
+        type=str,
+        default=None,
+        help="COCO test annotation json (required when --dataset_format=coco).",
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Image directory for COCO dataset. Defaults to the parent directory of the annotation json.",
+    )
     parser.add_argument(
         "--classes",
         type=str,
@@ -82,6 +102,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_iou_threshold", type=float, default=0.5, help="IoU threshold for TP/FP matching.")
     parser.add_argument("--eval_ap_score_threshold", type=float, default=1e-3, help="Score threshold used when computing AP.")
     parser.add_argument("--eval_pr_score_threshold", type=float, default=0.25, help="Score threshold used for precision/recall.")
+    parser.add_argument(
+        "--eval_metric",
+        type=str,
+        choices=list(EVAL_METRIC_CHOICES),
+        default="mAP50",
+        help="Primary metric to highlight in logs and console output.",
+    )
     parser.add_argument(
         "--vis-batch",
         "--vis_batch",
@@ -131,7 +158,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to decode and output class embedding information.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.dataset_format == "yolo":
+        if args.dataset_yaml is None:
+            raise ValueError("--dataset_yaml is required when --dataset_format=yolo.")
+    elif args.dataset_format == "coco":
+        if args.test_json is None:
+            raise ValueError("--test_json is required when --dataset_format=coco.")
+
+    return args
 
 def _to_pil_image_from_normalized_chw(img_chw: torch.Tensor) -> Image.Image:
     mean = torch.tensor([0.485, 0.456, 0.406], dtype=img_chw.dtype, device=img_chw.device).view(3, 1, 1)
@@ -246,7 +282,12 @@ def main() -> None:
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    classes = parse_classes(args.classes, args.dataset_yaml)
+    classes_source = (
+        args.dataset_yaml
+        if args.dataset_format == "yolo"
+        else args.test_json
+    )
+    classes = parse_classes(args.classes, classes_source, dataset_format=args.dataset_format)
     lora_targets = parse_lora_targets(args.lora_targets)
     lora_layers = parse_lora_layers(args.lora_layers)
     (log_dir / "train_args.json").write_text(
@@ -268,11 +309,20 @@ def main() -> None:
             TVT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    test_dataset = YoloDetectionDataset(
-        args.dataset_yaml,
-        split=args.test_split,
-        transform=test_transform,
-    )
+    if args.dataset_format == "yolo":
+        test_dataset = build_detection_dataset(
+            "yolo",
+            args.dataset_yaml,
+            split=args.test_split,
+            transform=test_transform,
+        )
+    else:
+        test_dataset = build_detection_dataset(
+            "coco",
+            args.test_json,
+            image_dir=args.image_dir,
+            transform=test_transform,
+        )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -350,13 +400,21 @@ def main() -> None:
             f"Saved {num_saved} visualization image(s) under {vis_dir} "
             f"(first {args.vis_batch} batch(es), score_threshold={vis_score_thr})."
         )
+    metric_summary = " ".join(
+        f"{name}={test_metrics[name]:.4f}" for name in EVAL_METRIC_CHOICES
+    )
     print(
-        f"mAP50={test_metrics['mAP50']:.4f} "
+        f"{metric_summary} "
         f"precision50={test_metrics['precision50']:.4f} "
         f"recall50={test_metrics['recall50']:.4f}"
     )
+    print(f"Primary metric ({args.eval_metric})={test_metrics[args.eval_metric]:.4f}")
 
-    test_log = {"test_metrics": test_metrics}
+    test_log = {
+        "test_metrics": test_metrics,
+        "primary_metric": args.eval_metric,
+        "primary_metric_value": test_metrics[args.eval_metric],
+    }
     if vis_info is not None:
         test_log["visualizations"] = vis_info
     if args.output_decode_info:

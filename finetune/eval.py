@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -9,6 +9,9 @@ from tqdm import tqdm
 
 from groundingdino.util import box_ops
 from groundingdino.util.misc import NestedTensor
+
+EVAL_METRIC_CHOICES = ("mAP50", "mAP75", "mAP50-95")
+COCO_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
 
 @dataclass
@@ -19,17 +22,17 @@ class Detection:
     box_xyxy: Tensor
 
 
+@dataclass
+class _ClassSample:
+    pred_boxes: Tensor
+    pred_scores: Tensor
+    gt_boxes: Tensor
+
+
 def _to_xyxy(boxes_cxcywh: Tensor) -> Tensor:
     if boxes_cxcywh.numel() == 0:
         return boxes_cxcywh.new_zeros((0, 4))
     return box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
-
-
-def _iou_single_to_many(box: Tensor, boxes: Tensor) -> Tensor:
-    if boxes.numel() == 0:
-        return boxes.new_zeros((0,))
-    ious, _ = box_ops.box_iou(box.unsqueeze(0), boxes)
-    return ious.squeeze(0)
 
 
 def _collect_predictions(
@@ -89,6 +92,101 @@ def _average_precision(recalls: Tensor, precisions: Tensor) -> float:
     return float(ap.item())
 
 
+def _match_class_predictions(
+    pred_boxes: Tensor,
+    pred_scores: Tensor,
+    gt_boxes: Tensor,
+    *,
+    iou_threshold: float,
+) -> Tuple[Tensor, Tensor]:
+    tp_cls = torch.zeros(pred_scores.shape[0], dtype=torch.float32)
+    fp_cls = torch.ones(pred_scores.shape[0], dtype=torch.float32)
+
+    n_gt = int(gt_boxes.shape[0])
+    if n_gt == 0 or pred_scores.numel() == 0:
+        return tp_cls, fp_cls
+
+    iou_mat, _ = box_ops.box_iou(pred_boxes, gt_boxes)
+    matched_gt = torch.zeros(n_gt, dtype=torch.bool)
+    best_ious, best_gt_idx = iou_mat.max(dim=1)
+    for pi in range(pred_scores.shape[0]):
+        gi = int(best_gt_idx[pi].item())
+        if float(best_ious[pi].item()) >= iou_threshold and not matched_gt[gi]:
+            tp_cls[pi] = 1.0
+            fp_cls[pi] = 0.0
+            matched_gt[gi] = True
+    return tp_cls, fp_cls
+
+
+def _compute_map_at_iou(
+    samples_by_class: List[List[_ClassSample]],
+    gt_count_by_class: Tensor,
+    num_classes: int,
+    *,
+    iou_threshold: float,
+    pr_score_threshold: float,
+) -> Tuple[float, int, int, int]:
+    aps: List[float] = []
+    tp_thr = 0
+    fp_thr = 0
+    fn_thr = 0
+
+    for cls_id in range(num_classes):
+        n_gt = int(gt_count_by_class[cls_id].item())
+        if n_gt == 0:
+            continue
+
+        if not samples_by_class[cls_id]:
+            fn_thr += n_gt
+            continue
+
+        scores_list: List[Tensor] = []
+        tp_list: List[Tensor] = []
+        fp_list: List[Tensor] = []
+
+        for sample in samples_by_class[cls_id]:
+            tp_cls, fp_cls = _match_class_predictions(
+                sample.pred_boxes,
+                sample.pred_scores,
+                sample.gt_boxes,
+                iou_threshold=iou_threshold,
+            )
+            if sample.pred_scores.numel() == 0:
+                continue
+            scores_list.append(sample.pred_scores)
+            tp_list.append(tp_cls)
+            fp_list.append(fp_cls)
+
+        if not scores_list:
+            fn_thr += n_gt
+            continue
+
+        scores = torch.cat(scores_list, dim=0)
+        tp = torch.cat(tp_list, dim=0)
+        fp = torch.cat(fp_list, dim=0)
+        order = torch.argsort(scores, descending=True)
+        scores = scores[order]
+        tp = tp[order]
+        fp = fp[order]
+
+        tp_cum = torch.cumsum(tp, dim=0)
+        fp_cum = torch.cumsum(fp, dim=0)
+        recalls = tp_cum / max(n_gt, 1)
+        precisions = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-8)
+        aps.append(_average_precision(recalls, precisions))
+
+        score_mask = scores >= pr_score_threshold
+        tp_sel = int(tp[score_mask].sum().item())
+        fp_sel = int(fp[score_mask].sum().item())
+        fn_sel = n_gt - tp_sel
+        tp_thr += tp_sel
+        fp_thr += fp_sel
+        fn_thr += fn_sel
+
+    mean_ap = float(sum(aps) / len(aps)) if aps else 0.0
+    return mean_ap, tp_thr, fp_thr, fn_thr
+
+
 @torch.no_grad()
 def evaluate_detection(
     model,
@@ -103,9 +201,7 @@ def evaluate_detection(
 ) -> Dict[str, float]:
     model.eval()
     num_classes = len(classes)
-    score_by_class: List[List[Tensor]] = [[] for _ in range(num_classes)]
-    tp_by_class: List[List[Tensor]] = [[] for _ in range(num_classes)]
-    fp_by_class: List[List[Tensor]] = [[] for _ in range(num_classes)]
+    samples_by_class: List[List[_ClassSample]] = [[] for _ in range(num_classes)]
     gt_count_by_class = torch.zeros(num_classes, dtype=torch.long)
 
     pbar = tqdm(data_loader, desc=progress_desc, leave=False)
@@ -122,14 +218,22 @@ def evaluate_detection(
             gt_boxes = _to_xyxy(target["boxes"].detach().cpu())
             gt_labels = target["labels"].detach().cpu()
             preds = preds_per_img[local_img_id]
-            if len(preds) == 0:
-                for cls_id in range(num_classes):
-                    gt_count_by_class[cls_id] += int((gt_labels == cls_id).sum().item())
-                continue
 
-            pred_boxes_all = torch.stack([det.box_xyxy for det in preds], dim=0)
-            pred_scores_all = torch.tensor([det.score for det in preds], dtype=torch.float32)
-            pred_cls_all = torch.tensor([det.cls_id for det in preds], dtype=torch.long)
+            pred_boxes_all = (
+                torch.stack([det.box_xyxy for det in preds], dim=0)
+                if preds
+                else torch.zeros((0, 4), dtype=torch.float32)
+            )
+            pred_scores_all = (
+                torch.tensor([det.score for det in preds], dtype=torch.float32)
+                if preds
+                else torch.zeros((0,), dtype=torch.float32)
+            )
+            pred_cls_all = (
+                torch.tensor([det.cls_id for det in preds], dtype=torch.long)
+                if preds
+                else torch.zeros((0,), dtype=torch.long)
+            )
 
             for cls_id in range(num_classes):
                 gt_mask = gt_labels == cls_id
@@ -138,78 +242,55 @@ def evaluate_detection(
                 gt_count_by_class[cls_id] += n_gt
 
                 pred_mask = pred_cls_all == cls_id
-                if pred_mask.sum().item() == 0:
-                    continue
-
                 pred_boxes_cls = pred_boxes_all[pred_mask]
                 pred_scores_cls = pred_scores_all[pred_mask]
-                order = torch.argsort(pred_scores_cls, descending=True)
-                pred_boxes_cls = pred_boxes_cls[order]
-                pred_scores_cls = pred_scores_cls[order]
+                if pred_scores_cls.numel() > 0:
+                    order = torch.argsort(pred_scores_cls, descending=True)
+                    pred_boxes_cls = pred_boxes_cls[order]
+                    pred_scores_cls = pred_scores_cls[order]
 
-                tp_cls = torch.zeros(pred_scores_cls.shape[0], dtype=torch.float32)
-                fp_cls = torch.ones(pred_scores_cls.shape[0], dtype=torch.float32)
+                samples_by_class[cls_id].append(
+                    _ClassSample(
+                        pred_boxes=pred_boxes_cls,
+                        pred_scores=pred_scores_cls,
+                        gt_boxes=gt_boxes_cls,
+                    )
+                )
 
-                if n_gt > 0:
-                    iou_mat, _ = box_ops.box_iou(pred_boxes_cls, gt_boxes_cls)
-                    matched_gt = torch.zeros(n_gt, dtype=torch.bool)
-                    best_ious, best_gt_idx = iou_mat.max(dim=1)
-                    for pi in range(pred_scores_cls.shape[0]):
-                        gi = int(best_gt_idx[pi].item())
-                        if float(best_ious[pi].item()) >= iou_threshold and not matched_gt[gi]:
-                            tp_cls[pi] = 1.0
-                            fp_cls[pi] = 0.0
-                            matched_gt[gi] = True
+    iou_thresholds = COCO_IOU_THRESHOLDS
+    if iou_threshold not in iou_thresholds:
+        iou_thresholds = tuple(sorted(set(iou_thresholds + (iou_threshold,))))
 
-                score_by_class[cls_id].append(pred_scores_cls)
-                tp_by_class[cls_id].append(tp_cls)
-                fp_by_class[cls_id].append(fp_cls)
+    map_by_iou: Dict[float, float] = {}
+    for thr in iou_thresholds:
+        mean_ap, _, _, _ = _compute_map_at_iou(
+            samples_by_class,
+            gt_count_by_class,
+            num_classes,
+            iou_threshold=thr,
+            pr_score_threshold=pr_score_threshold,
+        )
+        map_by_iou[thr] = mean_ap
 
-    aps: List[float] = []
-    tp_thr = 0
-    fp_thr = 0
-    fn_thr = 0
+    _, tp_thr, fp_thr, fn_thr = _compute_map_at_iou(
+        samples_by_class,
+        gt_count_by_class,
+        num_classes,
+        iou_threshold=0.5,
+        pr_score_threshold=pr_score_threshold,
+    )
 
-    for cls_id in range(num_classes):
-        n_gt = int(gt_count_by_class[cls_id].item())
-        if n_gt == 0:
-            continue
+    mAP50 = map_by_iou[0.5]
+    mAP75 = map_by_iou[0.75]
+    mAP50_95 = float(sum(map_by_iou[thr] for thr in COCO_IOU_THRESHOLDS) / len(COCO_IOU_THRESHOLDS))
 
-        if not score_by_class[cls_id]:
-            fn_thr += n_gt
-            continue
-
-        scores = torch.cat(score_by_class[cls_id], dim=0)
-        tp = torch.cat(tp_by_class[cls_id], dim=0)
-        fp = torch.cat(fp_by_class[cls_id], dim=0)
-        order = torch.argsort(scores, descending=True)
-        scores = scores[order]
-        tp = tp[order]
-        fp = fp[order]
-
-        if tp.numel() > 0:
-            tp_cum = torch.cumsum(tp, dim=0)
-            fp_cum = torch.cumsum(fp, dim=0)
-            recalls = tp_cum / max(n_gt, 1)
-            precisions = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-8)
-            aps.append(_average_precision(recalls, precisions))
-
-            score_mask = scores >= pr_score_threshold
-            tp_sel = int(tp[score_mask].sum().item())
-            fp_sel = int(fp[score_mask].sum().item())
-            fn_sel = n_gt - tp_sel
-            tp_thr += tp_sel
-            fp_thr += fp_sel
-            fn_thr += fn_sel
-        else:
-            fn_thr += n_gt
-
-    mAP50 = float(sum(aps) / len(aps)) if aps else 0.0
     precision50 = float(tp_thr / max(tp_thr + fp_thr, 1))
     recall50 = float(tp_thr / max(tp_thr + fn_thr, 1))
 
     return {
         "mAP50": mAP50,
+        "mAP75": mAP75,
+        "mAP50-95": mAP50_95,
         "precision50": precision50,
         "recall50": recall50,
     }

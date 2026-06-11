@@ -9,7 +9,8 @@ from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict
 
 from finetune import GroundingDINOWrapper
-from finetune.datasets.yolo import _load_yolo_yaml
+from finetune.datasets.coco import CocoDetectionDataset, _load_coco_json
+from finetune.datasets.yolo import YoloDetectionDataset, _load_yolo_yaml
 
 
 def set_seed(seed: int) -> None:
@@ -20,16 +21,39 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def parse_classes(classes_arg: str | None, dataset_yaml: str) -> List[str]:
+def parse_classes(
+    classes_arg: str | None,
+    dataset_path: str,
+    dataset_format: str = "yolo",
+) -> List[str]:
     if classes_arg:
         classes = [c.strip() for c in classes_arg.split(",") if c.strip()]
         if not classes:
             raise ValueError("--classes must be non-empty when provided.")
         return classes
-    cfg = _load_yolo_yaml(dataset_yaml)
+    if dataset_format == "yolo":
+        cfg = _load_yolo_yaml(dataset_path)
+    elif dataset_format == "coco":
+        cfg = _load_coco_json(dataset_path)
+    else:
+        raise ValueError(f"Unsupported dataset_format: {dataset_format!r}")
     if not cfg["class_names"]:
-        raise ValueError("No classes in dataset yaml. Please set --classes explicitly.")
+        raise ValueError("No classes in dataset config. Please set --classes explicitly.")
     return cfg["class_names"]
+
+
+def build_detection_dataset(
+    dataset_format: str,
+    path: str,
+    split: str = None,
+    image_dir: str | None = None,
+    transform=None,
+) -> YoloDetectionDataset | CocoDetectionDataset:
+    if dataset_format == "yolo":
+        return YoloDetectionDataset(path, split=split, transform=transform)
+    if dataset_format == "coco":
+        return CocoDetectionDataset(path, image_dir=image_dir, transform=transform)
+    raise ValueError(f"Unsupported dataset_format: {dataset_format!r}")
 
 
 def parse_lora_targets(raw: str) -> List[str]:
